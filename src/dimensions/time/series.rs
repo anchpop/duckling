@@ -8,18 +8,52 @@ use super::{
     resolve_weekend_interval, Direction, EarlyLate, PartOfDay, TimeData, TimeForm,
 };
 use crate::dimensions::time_grain::Grain;
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike};
 
 /// Internal representation matching Haskell's `TimeObject { start, grain, end }`.
 #[derive(Debug, Clone)]
 pub(crate) struct TimeObject {
-    pub start: DateTime<Utc>,
+    pub start: DateTime<FixedOffset>,
     pub grain: Grain,
-    pub end: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<FixedOffset>>,
 }
 
 /// Maximum number of series values to generate in each direction.
 const SAFE_MAX: usize = 10;
+
+/// Default per-parse budget for `generate_series_depth` invocations.
+///
+/// Each compose level fans out by ~2·SAFE_MAX, and a single parse can
+/// produce hundreds of top-level time candidates (Outlook-style calendar
+/// text with rows of weekday/number abbreviations hits this). 250K is ~5×
+/// what realistic parses measure at; pathological inputs that previously
+/// spun 20+ seconds bail out in a few hundred ms.
+pub(crate) const DEFAULT_WORK_BUDGET: usize = 250_000;
+
+/// Threaded work budget for time-resolution. Bounds cumulative
+/// `generate_series_depth` calls across one parse.
+///
+/// Passed explicitly through the resolve chain (rather than a thread-local)
+/// so the invariant is visible in types: callers who don't care about
+/// budgeting can pass `Budget::unlimited()`.
+pub(crate) struct Budget {
+    remaining: usize,
+}
+
+impl Budget {
+    pub(crate) fn new(initial: usize) -> Self {
+        Self { remaining: initial }
+    }
+
+    /// Charge one unit of work. Returns `false` when exhausted.
+    fn consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
 
 // ============================================================
 // TimeObject arithmetic — ports of Haskell's timePlus, timeEnd, timeIntersect
@@ -37,7 +71,7 @@ pub(crate) fn time_plus(t: &TimeObject, grain: Grain, n: i64) -> Option<TimeObje
 }
 
 /// Port of Haskell's `timeEnd`: end of a TimeObject's interval.
-fn time_end(t: &TimeObject) -> DateTime<Utc> {
+fn time_end(t: &TimeObject) -> DateTime<FixedOffset> {
     t.end
         .unwrap_or_else(|| add_grain(t.start, t.grain, 1).unwrap_or(t.start))
 }
@@ -192,7 +226,12 @@ fn series_hour_minute(
     let (hour_past, hour_future) = series_hour(h, is_12h, ref_time);
     let set_minute = |t: &TimeObject| -> Option<TimeObject> {
         let dt = t.start;
-        let new_start = dt.date_naive().and_hms_opt(dt.hour(), m, 0)?.and_utc();
+        let new_start = dt
+            .date_naive()
+            .and_hms_opt(dt.hour(), m, 0)?
+            .and_local_timezone(*ref_time.start.offset())
+            .single()
+            .unwrap();
         Some(TimeObject {
             start: new_start,
             grain: Grain::Minute,
@@ -297,7 +336,7 @@ fn series_part_of_day(
     early_late: Option<EarlyLate>,
 ) -> (Vec<TimeObject>, Vec<TimeObject>) {
     let date = ref_time.start.date_naive();
-    let (from, to) = pod_interval(pod, date, early_late);
+    let (from, to) = pod_interval(pod, date, early_late, *ref_time.start.offset());
     let anchor = TimeObject {
         start: from,
         grain: Grain::Hour,
@@ -446,7 +485,12 @@ fn series_holiday(
         // Fixed year → single value
         if let Some(date) = resolve_holiday(name, year) {
             let obj = TimeObject {
-                start: date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                start: date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.start.offset())
+                    .single()
+                    .unwrap(),
                 grain: Grain::Day,
                 end: None,
             };
@@ -470,16 +514,30 @@ fn series_holiday(
         // Check for interval holidays first
         if let Some((from_date, to_date)) = resolve_holiday_interval(name, y) {
             let obj = TimeObject {
-                start: from_date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                start: from_date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.start.offset())
+                    .single()
+                    .unwrap(),
                 grain: Grain::Day,
-                end: Some(to_date.and_hms_opt(0, 0, 0).unwrap().and_utc()),
+                end: Some(
+                    to_date
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_local_timezone(*ref_time.start.offset())
+                        .single()
+                        .unwrap(),
+                ),
             };
             if obj.start >= ref_time.start {
                 future.push(obj);
             } else {
                 past.push(obj);
             }
-        } else if let Some((from_dt, to_dt)) = resolve_holiday_minute_interval(name, y) {
+        } else if let Some((from_dt, to_dt)) =
+            resolve_holiday_minute_interval(name, y, *ref_time.start.offset())
+        {
             let obj = TimeObject {
                 start: from_dt,
                 grain: Grain::Minute,
@@ -492,7 +550,12 @@ fn series_holiday(
             }
         } else if let Some(date) = resolve_holiday(name, y) {
             let obj = TimeObject {
-                start: date.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                start: date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.start.offset())
+                    .single()
+                    .unwrap(),
                 grain: Grain::Day,
                 end: None,
             };
@@ -520,7 +583,12 @@ fn series_date_mdy(
         match date {
             Some(d) => {
                 let obj = TimeObject {
-                    start: d.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                    start: d
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_local_timezone(*ref_time.start.offset())
+                        .single()
+                        .unwrap(),
                     grain: Grain::Day,
                     end: None,
                 };
@@ -541,7 +609,12 @@ fn series_date_mdy(
             let y = ref_year.saturating_add(offset);
             if let Some(d) = NaiveDate::from_ymd_opt(y, month, day) {
                 let obj = TimeObject {
-                    start: d.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                    start: d
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_local_timezone(*ref_time.start.offset())
+                        .single()
+                        .unwrap(),
                     grain: Grain::Day,
                     end: None,
                 };
@@ -570,7 +643,7 @@ fn shift_interval(t: &TimeObject, grain: Grain, n: i64) -> Option<TimeObject> {
 
 /// Single-value helper: wraps a (DateTime, grain) as a one-element series.
 fn single_value(
-    dt: DateTime<Utc>,
+    dt: DateTime<FixedOffset>,
     grain: Grain,
     ref_time: &TimeObject,
 ) -> (Vec<TimeObject>, Vec<TimeObject>) {
@@ -589,8 +662,8 @@ fn single_value(
 /// Single interval value helper.
 #[allow(dead_code)]
 fn single_interval(
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: DateTime<FixedOffset>,
+    to: DateTime<FixedOffset>,
     grain: Grain,
     ref_time: &TimeObject,
 ) -> (Vec<TimeObject>, Vec<TimeObject>) {
@@ -610,20 +683,21 @@ fn single_interval(
 // Composed series: port of Haskell's runCompose
 // ============================================================
 
-/// Port of Haskell's `runCompose pred1 pred2`.
-/// For each occurrence of pred2, find the first match of pred1 within it.
-#[allow(clippy::type_complexity)]
-fn run_compose(
-    pred1: &dyn Fn(&TimeObject) -> (Vec<TimeObject>, Vec<TimeObject>),
-    pred2: &dyn Fn(&TimeObject) -> (Vec<TimeObject>, Vec<TimeObject>),
+/// Port of Haskell's `runCompose pred1 pred2`, threading a mutable `Budget`
+/// through both predicates. For each occurrence of pred2, find the first
+/// match of pred1 within it.
+fn run_compose_with(
+    mut pred1: impl FnMut(&TimeObject, &mut Budget) -> (Vec<TimeObject>, Vec<TimeObject>),
+    mut pred2: impl FnMut(&TimeObject, &mut Budget) -> (Vec<TimeObject>, Vec<TimeObject>),
     ref_time: &TimeObject,
+    budget: &mut Budget,
 ) -> (Vec<TimeObject>, Vec<TimeObject>) {
-    let (past2, future2) = pred2(ref_time);
+    let (past2, future2) = pred2(ref_time, budget);
 
-    let compute_serie = |tokens: &[TimeObject]| -> Vec<TimeObject> {
+    let mut compute_serie = |tokens: &[TimeObject], budget: &mut Budget| -> Vec<TimeObject> {
         let mut results = Vec::new();
         for time1 in tokens.iter().take(SAFE_MAX) {
-            let (_, inner_future) = pred1(time1);
+            let (_, inner_future) = pred1(time1, budget);
             for t in inner_future.iter() {
                 if starts_before_end_of(t, time1) {
                     if let Some(isect) = time_intersect(time1, t) {
@@ -636,8 +710,8 @@ fn run_compose(
         results
     };
 
-    let backward = compute_serie(&past2);
-    let forward = compute_serie(&future2);
+    let backward = compute_serie(&past2, budget);
+    let forward = compute_serie(&future2, budget);
     (backward, forward)
 }
 
@@ -649,8 +723,13 @@ fn run_compose(
 /// This is the main entry point matching Haskell's `runPredicate timePred refTime tc`.
 pub(crate) fn generate_series(
     data: &TimeData,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
+    budget: &mut Budget,
 ) -> (Vec<TimeObject>, Vec<TimeObject>) {
+    if !budget.consume() {
+        return (vec![], vec![]);
+    }
+
     let ref_obj = TimeObject {
         start: ref_time,
         grain: Grain::Second,
@@ -672,14 +751,17 @@ pub(crate) fn generate_series(
         }
         TimeForm::DateMDY { month, day, year } => series_date_mdy(*month, *day, *year, &ref_obj),
 
-        // Composed forms: use run_compose
+        // Composed forms: use run_compose. No explicit depth cap; the budget
+        // already bounds total work, and legitimate grammars (e.g. VI
+        // intersect chains) can legitimately nest deeper than any fixed cap.
         TimeForm::Composed(primary, secondary) => {
             let p = primary.clone();
             let s = secondary.clone();
-            run_compose(
-                &|t| generate_series(&p, t.start),
-                &|t| generate_series(&s, t.start),
+            run_compose_with(
+                |t, b| generate_series(&p, t.start, b),
+                |t, b| generate_series(&s, t.start, b),
                 &ref_obj,
+                budget,
             )
         }
 

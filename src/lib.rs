@@ -106,7 +106,14 @@ fn parse_inner(
     context: &Context,
     options: &Options,
 ) -> Vec<Entity> {
+    use dimensions::time::series::{Budget, DEFAULT_WORK_BUDGET};
     use types::ResolvedToken;
+
+    // Bound cumulative time-resolution work across this parse so one input
+    // cannot blow up from hundreds of compose-heavy candidates (see series.rs).
+    // The budget is threaded explicitly through resolve rather than stored in
+    // thread-local state.
+    let mut budget = Budget::new(DEFAULT_WORK_BUDGET);
 
     let rules = lang::rules_for(*locale, dims);
     let stash = engine::parse_string(text, rules);
@@ -122,7 +129,7 @@ fn parse_inner(
                 .unwrap_or(false)
         })
         .filter_map(|node| {
-            let entity = resolve::resolve(node, context, options, text)?;
+            let entity = resolve::resolve(node, context, options, text, &mut budget)?;
             Some(ResolvedToken {
                 node: node.clone(),
                 entity,
@@ -400,13 +407,15 @@ mod integration_tests {
 
     #[test]
     fn test_parse_time_dmy_slash_stays_naive() {
-        use chrono::{TimeZone, Utc};
+        use chrono::{FixedOffset, TimeZone};
         let locale = Locale::new(Lang::EN, Some(Region::GB));
-        let context = Context {
-            reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+        let context = Context::new(
+            FixedOffset::west_opt(2 * 3600)
+                .unwrap()
+                .with_ymd_and_hms(2013, 2, 12, 4, 30, 0)
+                .unwrap(),
             locale,
-            timezone_offset_minutes: -120,
-        };
+        );
         let options = Options::default();
         let entities = parse("15/2", &locale, &[DimensionKind::Time], &context, &options);
         let found = entities.iter().any(|e| {
@@ -425,13 +434,15 @@ mod integration_tests {
 
     #[test]
     fn test_parse_time_mdy_space_stays_naive() {
-        use chrono::{TimeZone, Utc};
+        use chrono::{FixedOffset, TimeZone};
         let locale = Locale::new(Lang::EN, Some(Region::US));
-        let context = Context {
-            reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+        let context = Context::new(
+            FixedOffset::west_opt(2 * 3600)
+                .unwrap()
+                .with_ymd_and_hms(2013, 2, 12, 4, 30, 0)
+                .unwrap(),
             locale,
-            timezone_offset_minutes: -120,
-        };
+        );
         let options = Options::default();
         let entities = parse(
             "10 31 1974",

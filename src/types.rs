@@ -15,7 +15,7 @@ use crate::dimensions::time::TimeData;
 use crate::dimensions::time_grain::Grain;
 use crate::dimensions::url::UrlData;
 use crate::dimensions::volume::VolumeData;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime};
 
 /// The kind of dimension to extract from text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,18 +110,19 @@ pub struct MeasurementPoint {
     pub unit: String,
 }
 
-/// A resolved time point — either an absolute UTC instant or a naive wall-clock time.
+/// A resolved time point — either an absolute fixed-offset instant or a naive wall-clock time.
 ///
 /// ```
 /// use duckling::{parse, Locale, Lang, Context, Options, DimensionKind,
 ///                DimensionValue, TimeValue, TimePoint, Grain};
-/// use chrono::{NaiveDate, TimeZone, Utc};
+/// use chrono::{FixedOffset, NaiveDate, TimeZone};
 ///
 /// let locale = Locale::new(Lang::EN, None);
-/// let context = Context {
-///     reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-///     ..Context::default()
-/// };
+/// let context = Context::new(
+///     FixedOffset::west_opt(2 * 3600).unwrap()
+///         .with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+///     locale,
+/// );
 /// let options = Options::default();
 ///
 /// // Wall-clock times are Naive (no timezone baked in)
@@ -131,19 +132,21 @@ pub struct MeasurementPoint {
 ///     assert_eq!(*grain, Grain::Hour);
 /// } else { panic!("expected Naive time point"); }
 ///
-/// // Relative offsets from now are Instant (pinned to UTC)
+/// // Relative offsets from now are Instant (pinned to an absolute offset-aware moment)
 /// let results = parse("in one hour", &locale, &[DimensionKind::Time], &context, &options);
 /// if let DimensionValue::Time(TimeValue::Single { value: TimePoint::Instant { value, grain }, .. }) = &results[0].value {
-///     assert_eq!(*value, Utc.with_ymd_and_hms(2013, 2, 12, 5, 30, 0).unwrap());
+///     let expected = FixedOffset::west_opt(2 * 3600).unwrap()
+///         .with_ymd_and_hms(2013, 2, 12, 5, 30, 0).unwrap();
+///     assert_eq!(*value, expected);
 ///     assert_eq!(*grain, Grain::Minute);
 /// } else { panic!("expected Instant time point"); }
 /// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum TimePoint {
-    /// An absolute UTC moment (e.g. "now", "in 2 hours", "5pm EST").
+    /// An absolute fixed-offset moment (e.g. "now", "in 2 hours", "5pm EST").
     Instant {
-        /// The UTC datetime.
-        value: DateTime<Utc>,
+        /// The offset-aware datetime.
+        value: DateTime<FixedOffset>,
         /// The precision grain.
         grain: Grain,
     },
@@ -165,18 +168,31 @@ impl TimePoint {
     }
 }
 
+/// A pair of interval endpoints, used in the `values` array for intervals.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct IntervalEndpoints {
+    /// The start of the interval, if bounded.
+    pub from: Option<TimePoint>,
+    /// The end of the interval, if bounded.
+    pub to: Option<TimePoint>,
+}
+
 /// A resolved time value — either a single point or an interval.
+///
+/// Includes a `values` array of up to 3 next occurrences, matching Haskell's
+/// `TimeValue SingleTimeValue [SingleTimeValue]`.
 ///
 /// ```
 /// use duckling::{parse, Locale, Lang, Context, Options, DimensionKind,
 ///                DimensionValue, TimeValue, TimePoint, Grain};
-/// use chrono::{NaiveDate, TimeZone, Utc};
+/// use chrono::{FixedOffset, NaiveDate, TimeZone};
 ///
 /// let locale = Locale::new(Lang::EN, None);
-/// let context = Context {
-///     reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-///     ..Context::default()
-/// };
+/// let context = Context::new(
+///     FixedOffset::west_opt(2 * 3600).unwrap()
+///         .with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+///     locale,
+/// );
 /// let options = Options::default();
 ///
 /// // Single time point
@@ -195,18 +211,6 @@ impl TimePoint {
 ///         if *value == NaiveDate::from_ymd_opt(2013, 2, 12).unwrap().and_hms_opt(18, 0, 0).unwrap()));
 /// } else { panic!("expected Interval time value"); }
 /// ```
-/// A pair of interval endpoints, used in the `values` array for intervals.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct IntervalEndpoints {
-    /// The start of the interval, if bounded.
-    pub from: Option<TimePoint>,
-    /// The end of the interval, if bounded.
-    pub to: Option<TimePoint>,
-}
-
-/// A resolved time value — either a single point or an interval.
-/// Includes a `values` array of up to 3 next occurrences, matching Haskell's
-/// `TimeValue SingleTimeValue [SingleTimeValue]`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum TimeValue {
     /// A single time point with additional future occurrences.

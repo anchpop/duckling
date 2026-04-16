@@ -103,8 +103,11 @@ pub fn parse_and_resolve(
     options: &Options,
     dims: &[DimensionKind],
 ) -> Vec<Entity> {
+    use crate::dimensions::time::series::{Budget, DEFAULT_WORK_BUDGET};
+
     let stash = parse_string(text, rules);
     let doc_text = text;
+    let mut budget = Budget::new(DEFAULT_WORK_BUDGET);
 
     let mut entities: Vec<Entity> = Vec::new();
     for node in stash.all_nodes() {
@@ -115,7 +118,8 @@ pub fn parse_and_resolve(
         } else {
             continue;
         }
-        if let Some(entity) = crate::resolve::resolve(node, context, options, doc_text) {
+        if let Some(entity) = crate::resolve::resolve(node, context, options, doc_text, &mut budget)
+        {
             entities.push(entity);
         }
     }
@@ -133,8 +137,11 @@ pub fn parse_and_resolve_with_nodes(
     options: &Options,
     dims: &[DimensionKind],
 ) -> Vec<(Node, Entity)> {
+    use crate::dimensions::time::series::{Budget, DEFAULT_WORK_BUDGET};
+
     let stash = parse_string(text, rules);
     let doc_text = text;
+    let mut budget = Budget::new(DEFAULT_WORK_BUDGET);
 
     let mut results: Vec<(Node, Entity)> = Vec::new();
     for node in stash.all_nodes() {
@@ -145,7 +152,8 @@ pub fn parse_and_resolve_with_nodes(
         } else {
             continue;
         }
-        if let Some(entity) = crate::resolve::resolve(node, context, options, doc_text) {
+        if let Some(entity) = crate::resolve::resolve(node, context, options, doc_text, &mut budget)
+        {
             results.push((node.clone(), entity));
         }
     }

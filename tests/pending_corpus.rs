@@ -4,7 +4,7 @@
 
 #![allow(clippy::needless_raw_string_hashes)]
 
-use chrono::{TimeZone, Utc};
+use chrono::{FixedOffset, TimeZone};
 use duckling::{parse, Context, DimensionKind, Lang, Locale, Options, Region};
 use regex::Regex;
 
@@ -84,11 +84,13 @@ fn extract_latent_examples_strings(corpus: &str) -> Vec<String> {
 }
 
 fn parse_context(locale: Locale) -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+    Context::new(
+        FixedOffset::west_opt(2 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2013, 2, 12, 4, 30, 0)
+            .unwrap(),
         locale,
-        timezone_offset_minutes: -120,
-    }
+    )
 }
 
 fn dim_from_name(dim: &str) -> DimensionKind {

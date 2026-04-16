@@ -1,15 +1,17 @@
 use crate::corpus::*;
 use crate::ranking::train::TrainingCorpus;
 use crate::Grain;
-use chrono::{TimeZone, Utc};
+use chrono::{FixedOffset, TimeZone};
 
 /// English time training corpus, ported from Duckling/Time/EN/Corpus.hs.
 pub fn corpus() -> TrainingCorpus {
-    let context = crate::resolve::Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-        locale: crate::locale::Locale::new(crate::locale::Lang::EN, None),
-        timezone_offset_minutes: -120,
-    };
+    let context = crate::resolve::Context::new(
+        FixedOffset::west_opt(2 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2013, 2, 12, 4, 30, 0)
+            .unwrap(),
+        crate::locale::Locale::new(crate::locale::Lang::EN, None),
+    );
     build_corpus(
         context,
         vec![

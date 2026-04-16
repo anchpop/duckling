@@ -534,11 +534,7 @@ mod tests {
 
     #[test]
     fn test_numeral_corpus() {
-        let context = Context {
-            reference_time: Utc::now(),
-            locale: crate::locale::Locale::default(),
-            timezone_offset_minutes: 0,
-        };
+        let context = Context::new(Utc::now().fixed_offset(), crate::locale::Locale::default());
         let mut corpus = Corpus::new(context);
 
         corpus.add(

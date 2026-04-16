@@ -31,7 +31,9 @@ pub mod zh;
 use crate::dimensions::time_grain::Grain;
 use crate::resolve::Context;
 use crate::types::{DimensionValue, IntervalEndpoints, TimePoint, TimeValue};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike,
+};
 #[cfg(not(debug_assertions))]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -283,12 +285,13 @@ fn is_instant_form(form: &TimeForm) -> bool {
 /// Matches Haskell's `values <- Just $ take 3 $ if null future then past else future`.
 fn generate_extra_values(
     data: &TimeData,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     primary: &TimePoint,
+    budget: &mut series::Budget,
 ) -> Vec<TimePoint> {
     let is_instant = is_instant_form(&data.form);
 
-    let (past, future) = series::generate_series(data, ref_time);
+    let (past, future) = series::generate_series(data, ref_time, budget);
     let source = if future.is_empty() { &past } else { &future };
 
     let to_time_point = |obj: &series::TimeObject| -> TimePoint {
@@ -302,7 +305,7 @@ fn generate_extra_values(
                     }
                 } else {
                     TimePoint::Naive {
-                        value: obj.start.naive_utc(),
+                        value: obj.start.naive_local(),
                         grain: obj.grain,
                     }
                 }
@@ -316,7 +319,7 @@ fn generate_extra_values(
                     }
                 } else {
                     TimePoint::Naive {
-                        value: obj.start.naive_utc(),
+                        value: obj.start.naive_local(),
                         grain: obj.grain,
                     }
                 }
@@ -338,12 +341,13 @@ fn generate_extra_values(
 #[allow(dead_code)]
 fn generate_interval_values(
     data: &TimeData,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     primary_from: &Option<TimePoint>,
     primary_to: &Option<TimePoint>,
     is_instant: bool,
+    budget: &mut series::Budget,
 ) -> Vec<IntervalEndpoints> {
-    let (past, future) = series::generate_series(data, ref_time);
+    let (past, future) = series::generate_series(data, ref_time, budget);
     let source = if future.is_empty() { &past } else { &future };
 
     let to_endpoints = |obj: &series::TimeObject| -> IntervalEndpoints {
@@ -354,7 +358,7 @@ fn generate_interval_values(
             })
         } else {
             Some(TimePoint::Naive {
-                value: obj.start.naive_utc(),
+                value: obj.start.naive_local(),
                 grain: obj.grain,
             })
         };
@@ -366,7 +370,7 @@ fn generate_interval_values(
                 }
             } else {
                 TimePoint::Naive {
-                    value: e.naive_utc(),
+                    value: e.naive_local(),
                     grain: obj.grain,
                 }
             }
@@ -393,7 +397,12 @@ fn generate_interval_values(
 // Main resolve entry point
 // ============================================================
 
-pub fn resolve(data: &TimeData, context: &Context, with_latent: bool) -> Option<DimensionValue> {
+pub fn resolve(
+    data: &TimeData,
+    context: &Context,
+    with_latent: bool,
+    budget: &mut series::Budget,
+) -> Option<DimensionValue> {
     if data.latent && !with_latent {
         return None;
     }
@@ -402,17 +411,12 @@ pub fn resolve(data: &TimeData, context: &Context, with_latent: bool) -> Option<
         return None;
     }
 
-    // Timezone shift: Haskell's shiftTimezone formula
-    // result = time + (contextOffset - providedOffset) minutes
-    // This mirrors Haskell where shiftTimezone wraps the predicate so shifted
-    // values are produced whenever that TimeData is resolved.
-    let tz_shift = tz_shift_for(data, context);
-    let has_tz = tz_shift.is_some();
-    let apply_tz = |dt: DateTime<Utc>| -> DateTime<Utc> {
-        match tz_shift {
-            Some(shift) => dt.checked_add_signed(shift).unwrap_or(dt),
-            None => dt,
-        }
+    let has_tz = data.timezone.as_deref().and_then(timezone_offset).is_some();
+    let apply_tz = |dt: DateTime<FixedOffset>| -> DateTime<FixedOffset> {
+        data.timezone
+            .as_deref()
+            .and_then(|tz_name| apply_named_timezone(dt, tz_name, context))
+            .unwrap_or(dt)
     };
 
     // 1. Open intervals (ASAP, after/before/since/until + time)
@@ -430,7 +434,7 @@ pub fn resolve(data: &TimeData, context: &Context, with_latent: bool) -> Option<
             }
         } else {
             TimePoint::Naive {
-                value: dt.naive_utc(),
+                value: dt.naive_local(),
                 grain,
             }
         };
@@ -486,12 +490,12 @@ pub fn resolve(data: &TimeData, context: &Context, with_latent: bool) -> Option<
         }
     } else {
         TimePoint::Naive {
-            value: dt.naive_utc(),
+            value: dt.naive_local(),
             grain,
         }
     };
     // Generate additional values from the series
-    let extra_values = generate_extra_values(data, context.reference_time, &point);
+    let extra_values = generate_extra_values(data, context.reference_time, &point, budget);
     Some(DimensionValue::Time(TimeValue::Single {
         value: point.clone(),
         values: extra_values,
@@ -501,7 +505,7 @@ pub fn resolve(data: &TimeData, context: &Context, with_latent: bool) -> Option<
 
 fn safe_try_resolve_as_interval(
     data: &TimeData,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     context: &Context,
 ) -> Option<TimeValue> {
     #[cfg(debug_assertions)]
@@ -521,9 +525,9 @@ fn safe_try_resolve_as_interval(
 
 fn safe_resolve_simple_datetime(
     form: &TimeForm,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     #[cfg(debug_assertions)]
     {
         resolve_simple_datetime(form, ref_time, direction)
@@ -550,7 +554,7 @@ fn duration_for_grain(n: i64, grain: Grain) -> Option<Duration> {
     }
 }
 
-fn relative_can_be_represented(base: DateTime<Utc>, n: i64, grain: Grain) -> bool {
+fn relative_can_be_represented(base: DateTime<FixedOffset>, n: i64, grain: Grain) -> bool {
     match grain {
         Grain::NoGrain | Grain::Second | Grain::Minute | Grain::Hour | Grain::Day | Grain::Week => {
             duration_for_grain(n, grain)
@@ -563,8 +567,8 @@ fn relative_can_be_represented(base: DateTime<Utc>, n: i64, grain: Grain) -> boo
     }
 }
 
-fn has_unrepresentable_relative(data: &TimeData, ref_time: DateTime<Utc>) -> bool {
-    fn check_form(form: &TimeForm, ref_time: DateTime<Utc>) -> bool {
+fn has_unrepresentable_relative(data: &TimeData, ref_time: DateTime<FixedOffset>) -> bool {
+    fn check_form(form: &TimeForm, ref_time: DateTime<FixedOffset>) -> bool {
         match form {
             TimeForm::RelativeGrain { n, grain } => {
                 !relative_can_be_represented(ref_time, *n, *grain)
@@ -593,45 +597,56 @@ fn has_unrepresentable_relative(data: &TimeData, ref_time: DateTime<Utc>) -> boo
     check_form(&data.form, ref_time)
 }
 
-/// Map timezone abbreviation to UTC offset in minutes
-fn timezone_offset_minutes(tz: &str) -> Option<i32> {
-    match tz.to_uppercase().as_str() {
-        "UTC" | "GMT" | "WET" => Some(0),
-        "CET" => Some(60),
-        "CEST" | "EET" => Some(120),
-        "IST" => Some(330), // Indian Standard Time (UTC+5:30)
-        "EEST" => Some(180),
-        "EST" => Some(-300),
-        "EDT" => Some(-240),
-        "CST" => Some(-360),
-        "CDT" => Some(-300),
-        "MST" => Some(-420),
-        "MDT" => Some(-360),
-        "PST" => Some(-480),
-        "PDT" => Some(-420),
-        "BST" | "WEST" => Some(60),
-        "JST" | "KST" => Some(540),
-        "HKT" | "SGT" => Some(480),
-        "AEST" => Some(600),
-        "AEDT" => Some(660),
-        "ACST" => Some(570),
-        "ACDT" => Some(630),
-        "AWST" => Some(480),
-        "NZST" => Some(720),
-        "NZDT" => Some(780),
-        _ => None,
-    }
+/// Map timezone abbreviation to a fixed offset.
+fn timezone_offset(tz: &str) -> Option<FixedOffset> {
+    let minutes: i32 = match tz.to_uppercase().as_str() {
+        "UTC" | "GMT" | "WET" => 0,
+        "CET" => 60,
+        "CEST" | "EET" => 120,
+        "IST" => 330, // Indian Standard Time (UTC+5:30)
+        "EEST" => 180,
+        "EST" => -300,
+        "EDT" => -240,
+        "CST" => -360,
+        "CDT" => -300,
+        "MST" => -420,
+        "MDT" => -360,
+        "PST" => -480,
+        "PDT" => -420,
+        "BST" | "WEST" => 60,
+        "JST" | "KST" => 540,
+        "HKT" | "SGT" => 480,
+        "AEST" => 600,
+        "AEDT" => 660,
+        "ACST" => 570,
+        "ACDT" => 630,
+        "AWST" => 480,
+        "NZST" => 720,
+        "NZDT" => 780,
+        _ => return None,
+    };
+    FixedOffset::east_opt(minutes.checked_mul(60)?)
 }
 
-/// Compute timezone shift for a TimeData, matching Haskell's shiftTimezone.
-/// Each TimeData carries its own timezone (like Haskell's per-predicate shift).
-fn tz_shift_for(data: &TimeData, context: &Context) -> Option<Duration> {
-    data.timezone.as_ref().and_then(|tz_name| {
-        let provided_offset = timezone_offset_minutes(tz_name)?;
-        let ctx_offset = context.timezone_offset_minutes;
-        let diff = ctx_offset.checked_sub(provided_offset).unwrap_or(0);
-        Duration::try_minutes(i64::from(diff))
-    })
+fn reinterpret_in_timezone(
+    dt: DateTime<FixedOffset>,
+    source_offset: FixedOffset,
+    target_offset: FixedOffset,
+) -> Option<DateTime<FixedOffset>> {
+    let source = source_offset
+        .from_local_datetime(&dt.naive_local())
+        .single()?;
+    Some(source.with_timezone(&target_offset))
+}
+
+/// Reinterpret a timezone-tagged clock time in the provided zone, then convert it
+/// back into the context zone so the absolute instant is preserved.
+fn apply_named_timezone(
+    dt: DateTime<FixedOffset>,
+    tz_name: &str,
+    context: &Context,
+) -> Option<DateTime<FixedOffset>> {
+    reinterpret_in_timezone(dt, timezone_offset(tz_name)?, context.timezone())
 }
 
 // ============================================================
@@ -640,7 +655,7 @@ fn tz_shift_for(data: &TimeData, context: &Context) -> Option<Duration> {
 
 fn try_resolve_as_interval(
     data: &TimeData,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     context: &Context,
 ) -> Option<TimeValue> {
     match &data.form {
@@ -672,7 +687,7 @@ fn try_resolve_as_interval(
                     }
                 } else {
                     TimePoint::Naive {
-                        value: to_dt.naive_utc(),
+                        value: to_dt.naive_local(),
                         grain: g,
                     }
                 });
@@ -693,9 +708,16 @@ fn try_resolve_as_interval(
                 resolve_simple_datetime(&to_data.form, ref_time, to_data.direction)?;
 
             // Apply per-endpoint timezone shifts (Haskell: each predicate carries its own shift)
-            let from_tz = tz_shift_for(from_data, context);
-            let to_tz = tz_shift_for(to_data, context);
-            let has_endpoint_tz = from_tz.is_some() || to_tz.is_some();
+            let has_endpoint_tz = from_data
+                .timezone
+                .as_deref()
+                .and_then(timezone_offset)
+                .is_some()
+                || to_data
+                    .timezone
+                    .as_deref()
+                    .and_then(timezone_offset)
+                    .is_some();
 
             // Get the raw hours for AM/PM disambiguation
             let from_hour = match &from_data.form {
@@ -732,8 +754,10 @@ fn try_resolve_as_interval(
                             from_dt = ref_time
                                 .date_naive()
                                 .and_hms_opt(from_h.saturating_add(12), mins, 0)
-                                .unwrap_or(from_dt.naive_utc())
-                                .and_utc();
+                                .unwrap_or(from_dt.naive_local())
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                         }
                     }
                 }
@@ -751,8 +775,10 @@ fn try_resolve_as_interval(
                             to_dt = ref_time
                                 .date_naive()
                                 .and_hms_opt(to_h.saturating_add(12), mins, 0)
-                                .unwrap_or(to_dt.naive_utc())
-                                .and_utc();
+                                .unwrap_or(to_dt.naive_local())
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                         }
                     }
                 }
@@ -772,12 +798,13 @@ fn try_resolve_as_interval(
             };
 
             // Apply per-endpoint timezone shifts after all disambiguation
-            if let Some(shift) = from_tz {
-                from_dt = from_dt.checked_add_signed(shift).unwrap_or(from_dt);
+            if let Some(tz_name) = from_data.timezone.as_deref() {
+                from_dt = apply_named_timezone(from_dt, tz_name, context).unwrap_or(from_dt);
             }
-            let to_dt = match to_tz {
-                Some(shift) => to_dt.checked_add_signed(shift).unwrap_or(to_dt),
-                None => to_dt,
+            let to_dt = if let Some(tz_name) = to_data.timezone.as_deref() {
+                apply_named_timezone(to_dt, tz_name, context).unwrap_or(to_dt)
+            } else {
+                to_dt
             };
 
             // Use the finer grain of from and to (matching Haskell: min g1 g2)
@@ -831,7 +858,7 @@ fn try_resolve_as_interval(
         }
         TimeForm::PartOfDay(pod) => {
             let date = ref_time.date_naive();
-            let (from, to) = pod_interval(*pod, date, data.early_late);
+            let (from, to) = pod_interval(*pod, date, data.early_late, *ref_time.offset());
             Some(make_interval(from, to, "hour"))
         }
         TimeForm::Weekend => {
@@ -885,24 +912,32 @@ fn try_resolve_as_interval(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 Grain::Month,
                 1,
             )?;
             let (from, to) = match data.early_late {
                 Some(EarlyLate::Early) => {
                     // Beginning of month: day 1 to day 11
-                    (make_date(y, m, 1), make_date(y, m, 11))
+                    (
+                        make_date(y, m, 1, *ref_time.offset()),
+                        make_date(y, m, 11, *ref_time.offset()),
+                    )
                 }
                 Some(EarlyLate::Mid) => {
                     // Middle of month: day 11 to day 21
-                    (make_date(y, m, 11), make_date(y, m, 21))
+                    (
+                        make_date(y, m, 11, *ref_time.offset()),
+                        make_date(y, m, 21, *ref_time.offset()),
+                    )
                 }
                 Some(EarlyLate::Late) => {
                     // End of month: day 21 to end
-                    (make_date(y, m, 21), month_end)
+                    (make_date(y, m, 21, *ref_time.offset()), month_end)
                 }
-                None => (make_date(y, m, 1), month_end), // shouldn't happen
+                None => (make_date(y, m, 1, *ref_time.offset()), month_end), // shouldn't happen
             };
             Some(make_interval(from, to, "day"))
         }
@@ -960,8 +995,12 @@ fn try_resolve_as_interval(
                     let (date_dt, _) =
                         resolve_simple_datetime(&primary.form, ref_time, primary.direction)?;
                     let date = date_dt.date_naive();
-                    let (from, to) =
-                        pod_interval(*pod, date, data.early_late.or(secondary.early_late));
+                    let (from, to) = pod_interval(
+                        *pod,
+                        date,
+                        data.early_late.or(secondary.early_late),
+                        *ref_time.offset(),
+                    );
                     return Some(make_interval(from, to, "hour"));
                 }
             }
@@ -972,8 +1011,12 @@ fn try_resolve_as_interval(
                     let (date_dt, _) =
                         resolve_simple_datetime(&secondary.form, ref_time, secondary.direction)?;
                     let date = date_dt.date_naive();
-                    let (from, to) =
-                        pod_interval(*pod, date, data.early_late.or(primary.early_late));
+                    let (from, to) = pod_interval(
+                        *pod,
+                        date,
+                        data.early_late.or(primary.early_late),
+                        *ref_time.offset(),
+                    );
                     return Some(make_interval(from, to, "hour"));
                 }
             }
@@ -985,8 +1028,12 @@ fn try_resolve_as_interval(
                         let (date_dt, _) =
                             resolve_simple_datetime(&primary.form, ref_time, primary.direction)?;
                         let date = date_dt.date_naive();
-                        let (from, to) =
-                            pod_interval(*pod, date, data.early_late.or(sub_a.early_late));
+                        let (from, to) = pod_interval(
+                            *pod,
+                            date,
+                            data.early_late.or(sub_a.early_late),
+                            *ref_time.offset(),
+                        );
                         return Some(make_interval(from, to, "hour"));
                     }
                 }
@@ -995,8 +1042,12 @@ fn try_resolve_as_interval(
                         let (date_dt, _) =
                             resolve_simple_datetime(&primary.form, ref_time, primary.direction)?;
                         let date = date_dt.date_naive();
-                        let (from, to) =
-                            pod_interval(*pod, date, data.early_late.or(sub_b.early_late));
+                        let (from, to) = pod_interval(
+                            *pod,
+                            date,
+                            data.early_late.or(sub_b.early_late),
+                            *ref_time.offset(),
+                        );
                         return Some(make_interval(from, to, "hour"));
                     }
                 }
@@ -1024,7 +1075,12 @@ fn try_resolve_as_interval(
                     match &clock.form {
                         TimeForm::Hour(h, is_12h) => {
                             let hour = disambiguate_hour(*h, *is_12h, Some(pod));
-                            let mut dt = date_dt.date_naive().and_hms_opt(hour, 0, 0)?.and_utc();
+                            let mut dt = date_dt
+                                .date_naive()
+                                .and_hms_opt(hour, 0, 0)?
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                                 dt = Duration::try_days(1)
                                     .and_then(|d| dt.checked_add_signed(d))
@@ -1032,7 +1088,7 @@ fn try_resolve_as_interval(
                             }
                             {
                                 let point = TimePoint::Naive {
-                                    value: dt.naive_utc(),
+                                    value: dt.naive_local(),
                                     grain: Grain::Hour,
                                 };
                                 return Some(TimeValue::Single {
@@ -1044,7 +1100,12 @@ fn try_resolve_as_interval(
                         }
                         TimeForm::HourMinute(h, m, is_12h) => {
                             let hour = disambiguate_hour(*h, *is_12h, Some(pod));
-                            let mut dt = date_dt.date_naive().and_hms_opt(hour, *m, 0)?.and_utc();
+                            let mut dt = date_dt
+                                .date_naive()
+                                .and_hms_opt(hour, *m, 0)?
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                                 dt = Duration::try_days(1)
                                     .and_then(|d| dt.checked_add_signed(d))
@@ -1052,7 +1113,7 @@ fn try_resolve_as_interval(
                             }
                             {
                                 let point = TimePoint::Naive {
-                                    value: dt.naive_utc(),
+                                    value: dt.naive_local(),
                                     grain: Grain::Minute,
                                 };
                                 return Some(TimeValue::Single {
@@ -1073,8 +1134,12 @@ fn try_resolve_as_interval(
                         // e.g., Composed(Morning, Christmas) + Year(2013) → resolve Christmas+2013 first
                         let (date_dt, _) = resolve_composed(sub_b, secondary, ref_time)?;
                         let date = date_dt.date_naive();
-                        let (from, to) =
-                            pod_interval(*pod, date, data.early_late.or(sub_a.early_late));
+                        let (from, to) = pod_interval(
+                            *pod,
+                            date,
+                            data.early_late.or(sub_a.early_late),
+                            *ref_time.offset(),
+                        );
                         return Some(make_interval(from, to, "hour"));
                     }
                 }
@@ -1083,8 +1148,12 @@ fn try_resolve_as_interval(
                         // Combine the non-PartOfDay part (sub_a) with secondary to get the date
                         let (date_dt, _) = resolve_composed(sub_a, secondary, ref_time)?;
                         let date = date_dt.date_naive();
-                        let (from, to) =
-                            pod_interval(*pod, date, data.early_late.or(sub_b.early_late));
+                        let (from, to) = pod_interval(
+                            *pod,
+                            date,
+                            data.early_late.or(sub_b.early_late),
+                            *ref_time.offset(),
+                        );
                         return Some(make_interval(from, to, "hour"));
                     }
                 }
@@ -1112,7 +1181,12 @@ fn try_resolve_as_interval(
                     match &clock.form {
                         TimeForm::Hour(h, is_12h) => {
                             let hour = disambiguate_hour(*h, *is_12h, Some(pod));
-                            let mut dt = date_dt.date_naive().and_hms_opt(hour, 0, 0)?.and_utc();
+                            let mut dt = date_dt
+                                .date_naive()
+                                .and_hms_opt(hour, 0, 0)?
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                                 dt = Duration::try_days(1)
                                     .and_then(|d| dt.checked_add_signed(d))
@@ -1120,7 +1194,7 @@ fn try_resolve_as_interval(
                             }
                             {
                                 let point = TimePoint::Naive {
-                                    value: dt.naive_utc(),
+                                    value: dt.naive_local(),
                                     grain: Grain::Hour,
                                 };
                                 return Some(TimeValue::Single {
@@ -1132,7 +1206,12 @@ fn try_resolve_as_interval(
                         }
                         TimeForm::HourMinute(h, m, is_12h) => {
                             let hour = disambiguate_hour(*h, *is_12h, Some(pod));
-                            let mut dt = date_dt.date_naive().and_hms_opt(hour, *m, 0)?.and_utc();
+                            let mut dt = date_dt
+                                .date_naive()
+                                .and_hms_opt(hour, *m, 0)?
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap();
                             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                                 dt = Duration::try_days(1)
                                     .and_then(|d| dt.checked_add_signed(d))
@@ -1140,7 +1219,7 @@ fn try_resolve_as_interval(
                             }
                             {
                                 let point = TimePoint::Naive {
-                                    value: dt.naive_utc(),
+                                    value: dt.naive_local(),
                                     grain: Grain::Minute,
                                 };
                                 return Some(TimeValue::Single {
@@ -1216,13 +1295,25 @@ fn try_resolve_as_interval(
         TimeForm::Holiday(name, year_opt) => {
             let year = year_opt.unwrap_or(ref_time.year());
             // Check for minute-level intervals (Earth Hour)
-            if let Some((from_dt, to_dt)) = resolve_holiday_minute_interval(name, year) {
+            if let Some((from_dt, to_dt)) =
+                resolve_holiday_minute_interval(name, year, *ref_time.offset())
+            {
                 return Some(make_interval(from_dt, to_dt, "minute"));
             }
             // Check for day-level intervals
             if let Some((from_date, to_date)) = resolve_holiday_interval(name, year) {
-                let from_dt = from_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-                let to_dt = to_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                let from_dt = from_date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
+                let to_dt = to_date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 return Some(make_interval(from_dt, to_dt, "day"));
             }
             None
@@ -1236,7 +1327,9 @@ fn try_resolve_as_interval(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 TimeForm::GrainOffset {
                     grain: Grain::Month,
                     offset,
@@ -1250,11 +1343,21 @@ fn try_resolve_as_interval(
             let friday = sat
                 .checked_sub_signed(chrono::Duration::try_days(1).unwrap_or_default())
                 .unwrap_or(sat);
-            let from = friday.and_hms_opt(18, 0, 0).unwrap().and_utc();
+            let from = friday
+                .and_hms_opt(18, 0, 0)
+                .unwrap()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             let monday = sat
                 .checked_add_signed(chrono::Duration::try_days(2).unwrap_or_default())
                 .unwrap_or(sat);
-            let to = monday.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let to = monday
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             Some(make_interval(from, to, "hour"))
         }
         _ => None,
@@ -1265,29 +1368,35 @@ fn try_resolve_as_interval(
 fn resolve_on_date(
     form: &TimeForm,
     date: NaiveDate,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     Some(match form {
         TimeForm::Hour(h, _is_12h) => {
             let dt = date
                 .and_hms_opt(*h, 0, 0)
                 .unwrap_or(date.and_hms_opt(0, 0, 0).unwrap())
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "hour")
         }
         TimeForm::HourMinute(h, m, _is_12h) => {
             let dt = date
                 .and_hms_opt(*h, *m, 0)
                 .unwrap_or(date.and_hms_opt(0, 0, 0).unwrap())
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "minute")
         }
         TimeForm::HourMinuteSecond(h, m, s) => {
             let dt = date
                 .and_hms_opt(*h, *m, *s)
                 .unwrap_or(date.and_hms_opt(0, 0, 0).unwrap())
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "second")
         }
         TimeForm::Composed(_primary, _secondary) => {
@@ -1296,7 +1405,9 @@ fn resolve_on_date(
             let new_dt = date
                 .and_hms_opt(dt.hour(), dt.minute(), dt.second())
                 .unwrap_or(date.and_hms_opt(0, 0, 0).unwrap())
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (new_dt, grain)
         }
         _ => {
@@ -1307,14 +1418,14 @@ fn resolve_on_date(
     })
 }
 
-fn make_interval(from: DateTime<Utc>, to: DateTime<Utc>, grain: &str) -> TimeValue {
+fn make_interval(from: DateTime<FixedOffset>, to: DateTime<FixedOffset>, grain: &str) -> TimeValue {
     let g = Grain::from_str(grain);
     let from_point = Some(TimePoint::Naive {
-        value: from.naive_utc(),
+        value: from.naive_local(),
         grain: g,
     });
     let to_point = Some(TimePoint::Naive {
-        value: to.naive_utc(),
+        value: to.naive_local(),
         grain: g,
     });
     TimeValue::Interval {
@@ -1331,10 +1442,10 @@ fn make_interval(from: DateTime<Utc>, to: DateTime<Utc>, grain: &str) -> TimeVal
 /// For closed intervals, add one grain to "to".
 /// Uses the finer grain between from and to (matching Haskell behavior).
 fn adjust_interval_end_with_from(
-    to: DateTime<Utc>,
+    to: DateTime<FixedOffset>,
     to_form: &TimeForm,
     from_form: &TimeForm,
-) -> Option<DateTime<Utc>> {
+) -> Option<DateTime<FixedOffset>> {
     let to_grain = form_grain(to_form);
     let from_grain = form_grain(from_form);
     // Match Haskell: g2' = if g1 < Day && g2 < Day then min(g1,g2) else g2
@@ -1417,9 +1528,9 @@ pub(super) fn form_grain(f: &TimeForm) -> Grain {
 
 pub(super) fn resolve_simple_datetime(
     form: &TimeForm,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     Some(match form {
         TimeForm::Now => (ref_time, "second"),
         TimeForm::Today => (midnight(ref_time), "day"),
@@ -1462,7 +1573,12 @@ pub(super) fn resolve_simple_datetime(
             let date = NaiveDate::from_ymd_opt(ref_time.year(), ref_time.month(), *d);
             match date {
                 Some(date) => {
-                    let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                    let dt = date
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_local_timezone(*ref_time.offset())
+                        .single()
+                        .unwrap();
                     if dt < ref_time && !matches!(direction, Some(Direction::Past)) {
                         // Try next month
                         let next = if ref_time.month() == 12 {
@@ -1475,7 +1591,14 @@ pub(super) fn resolve_simple_datetime(
                             )
                         };
                         match next {
-                            Some(nd) => (nd.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day"),
+                            Some(nd) => (
+                                nd.and_hms_opt(0, 0, 0)
+                                    .unwrap()
+                                    .and_local_timezone(*ref_time.offset())
+                                    .single()
+                                    .unwrap(),
+                                "day",
+                            ),
                             None => (dt, "day"),
                         }
                     } else {
@@ -1489,8 +1612,10 @@ pub(super) fn resolve_simple_datetime(
             let mut dt = ref_time
                 .date_naive()
                 .and_hms_opt(*h, 0, 0)
-                .unwrap_or(ref_time.naive_utc())
-                .and_utc();
+                .unwrap_or(ref_time.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             // Future-first: if past, use tomorrow
             if dt <= ref_time && !matches!(direction, Some(Direction::Past)) {
                 dt = Duration::try_days(1)
@@ -1503,16 +1628,20 @@ pub(super) fn resolve_simple_datetime(
             let today = ref_time
                 .date_naive()
                 .and_hms_opt(*h, *m, 0)
-                .unwrap_or(ref_time.naive_utc())
-                .and_utc();
+                .unwrap_or(ref_time.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             if *is_12h && *h < 12 {
                 // 12h ambiguous: try both AM and PM
                 let am = today;
                 let pm = ref_time
                     .date_naive()
                     .and_hms_opt(h.saturating_add(12), *m, 0)
-                    .unwrap_or(ref_time.naive_utc())
-                    .and_utc();
+                    .unwrap_or(ref_time.naive_local())
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 if matches!(direction, Some(Direction::Past)) {
                     // Past direction: pick most recent past
                     if pm <= ref_time {
@@ -1551,8 +1680,10 @@ pub(super) fn resolve_simple_datetime(
                 let midnight = ref_time
                     .date_naive()
                     .and_hms_opt(0, *m, 0)
-                    .unwrap_or(ref_time.naive_utc())
-                    .and_utc();
+                    .unwrap_or(ref_time.naive_local())
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 if noon > ref_time {
                     (noon, "minute")
                 } else if Duration::try_days(1)
@@ -1595,8 +1726,10 @@ pub(super) fn resolve_simple_datetime(
             let dt = ref_time
                 .date_naive()
                 .and_hms_opt(*h, *m, *s)
-                .unwrap_or(ref_time.naive_utc())
-                .and_utc();
+                .unwrap_or(ref_time.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "second")
         }
         TimeForm::Year(y) => {
@@ -1604,16 +1737,20 @@ pub(super) fn resolve_simple_datetime(
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "year")
         }
         TimeForm::RelativeGrain { n, grain } => resolve_relative_grain(*n, *grain, ref_time)?,
         TimeForm::DateMDY { month, day, year } => {
-            let build = |y: i32| -> Option<DateTime<Utc>> {
+            let build = |y: i32| -> Option<DateTime<FixedOffset>> {
                 Some(
                     NaiveDate::from_ymd_opt(y, *month, *day)?
                         .and_hms_opt(0, 0, 0)?
-                        .and_utc(),
+                        .and_local_timezone(*ref_time.offset())
+                        .single()
+                        .unwrap(),
                 )
             };
             let dt = if let Some(y) = year {
@@ -1656,7 +1793,9 @@ pub(super) fn resolve_simple_datetime(
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "quarter")
         }
         TimeForm::QuarterYear(q, y) => {
@@ -1665,14 +1804,23 @@ pub(super) fn resolve_simple_datetime(
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, "quarter")
         }
         TimeForm::Holiday(name, year_opt) => {
             if let Some(year) = year_opt {
                 // Explicit year: resolve holiday for that year
                 match resolve_holiday(name, *year) {
-                    Some(date) => (date.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day"),
+                    Some(date) => (
+                        date.and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_local_timezone(*ref_time.offset())
+                            .single()
+                            .unwrap(),
+                        "day",
+                    ),
                     None => (midnight(ref_time), "day"),
                 }
             } else {
@@ -1688,7 +1836,9 @@ pub(super) fn resolve_simple_datetime(
                     .date_naive()
                     .and_hms_opt(12, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 "hour",
             )
         }
@@ -1733,7 +1883,9 @@ pub(super) fn resolve_simple_datetime(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 TimeForm::GrainOffset {
                     grain: Grain::Month,
                     offset,
@@ -1751,7 +1903,14 @@ pub(super) fn resolve_simple_datetime(
                 _ => grain_start(base_dt, Grain::Month),
             };
             let dt = nth_dow_of_month(base_start.year(), base_start.month(), *dow, *n as u32);
-            (dt.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day")
+            (
+                dt.and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
+                "day",
+            )
         }
         TimeForm::LastDOWOfTime { dow, base } => {
             let (base_dt, _) = resolve_simple_datetime(&base.form, ref_time, base.direction)?;
@@ -1760,7 +1919,9 @@ pub(super) fn resolve_simple_datetime(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 TimeForm::GrainOffset {
                     grain: Grain::Month,
                     offset,
@@ -1771,7 +1932,14 @@ pub(super) fn resolve_simple_datetime(
                 _ => grain_start(base_dt, Grain::Month),
             };
             let dt = last_dow_of_month(base_start.year(), base_start.month(), *dow);
-            (dt.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day")
+            (
+                dt.and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
+                "day",
+            )
         }
         TimeForm::NDOWsFromTime { n, dow, base } => {
             // "2 Sundays from now" = find the Nth DOW after base
@@ -1822,7 +1990,7 @@ pub(super) fn resolve_simple_datetime(
             // Generates past and future occurrences of target relative to base,
             // then picks the nth closest by absolute distance.
             let (base_dt, _) = resolve_simple_datetime(&base.form, ref_time, base.direction)?;
-            let mut candidates: Vec<DateTime<Utc>> = Vec::new();
+            let mut candidates: Vec<DateTime<FixedOffset>> = Vec::new();
 
             // Determine the cyclic grain for generating candidates
             // Holidays and months cycle yearly; DOWs cycle weekly
@@ -1889,7 +2057,9 @@ pub(super) fn resolve_simple_datetime(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 TimeForm::GrainOffset {
                     grain: Grain::Month,
                     offset,
@@ -1938,7 +2108,7 @@ pub(super) fn resolve_simple_datetime(
             let (future_base, _) = resolve_simple_datetime(&base.form, ref_time, base.direction)?;
             let (past_base, _) =
                 resolve_simple_datetime(&base.form, ref_time, Some(Direction::Past))?;
-            let add_dur = |dt: DateTime<Utc>| -> Option<DateTime<Utc>> {
+            let add_dur = |dt: DateTime<FixedOffset>| -> Option<DateTime<FixedOffset>> {
                 match grain {
                     Grain::Year => add_years(dt, *n),
                     Grain::Month => add_months(dt, *n),
@@ -2016,7 +2186,11 @@ pub(super) fn resolve_simple_datetime(
 // Day of week resolution
 // ============================================================
 
-fn resolve_dow(dow: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) -> DateTime<Utc> {
+fn resolve_dow(
+    dow: u32,
+    ref_time: DateTime<FixedOffset>,
+    direction: Option<Direction>,
+) -> DateTime<FixedOffset> {
     let current = ref_time.weekday().num_days_from_monday();
     let target = dow;
 
@@ -2061,7 +2235,11 @@ fn resolve_dow(dow: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) 
 // Month resolution
 // ============================================================
 
-fn resolve_month(m: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) -> DateTime<Utc> {
+fn resolve_month(
+    m: u32,
+    ref_time: DateTime<FixedOffset>,
+    direction: Option<Direction>,
+) -> DateTime<FixedOffset> {
     let next_occurrence = if m > ref_time.month() || (m == ref_time.month() && direction.is_none())
     {
         NaiveDate::from_ymd_opt(ref_time.year(), m, 1)
@@ -2073,7 +2251,9 @@ fn resolve_month(m: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) 
         .unwrap_or(ref_time.date_naive())
         .and_hms_opt(0, 0, 0)
         .unwrap()
-        .and_utc();
+        .and_local_timezone(*ref_time.offset())
+        .single()
+        .unwrap();
 
     match direction {
         Some(Direction::Past) => {
@@ -2087,7 +2267,9 @@ fn resolve_month(m: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) 
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap()
         }
         Some(Direction::FarFuture) => {
             // "March after next": skip one occurrence
@@ -2100,7 +2282,9 @@ fn resolve_month(m: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) 
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap()
         }
         _ => base,
     }
@@ -2113,8 +2297,8 @@ fn resolve_month(m: u32, ref_time: DateTime<Utc>, direction: Option<Direction>) 
 fn resolve_relative_grain(
     n: i64,
     grain: Grain,
-    ref_time: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+    ref_time: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     let lower = grain.lower();
     let result = match grain {
         Grain::NoGrain | Grain::Second => {
@@ -2140,8 +2324,8 @@ fn resolve_relative_grain(
 fn resolve_grain_offset(
     grain: Grain,
     offset: i32,
-    ref_time: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+    ref_time: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     let result = match grain {
         Grain::Week => {
             let monday = start_of_week(ref_time);
@@ -2177,8 +2361,8 @@ fn resolve_grain_offset(
 fn resolve_composed(
     primary: &TimeData,
     secondary: &TimeData,
-    ref_time: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, &'static str)> {
+    ref_time: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, &'static str)> {
     // Helper: disambiguate hour based on PartOfDay context
     fn disambiguate_hour(h: u32, is_12h: bool, pod: Option<&PartOfDay>) -> u32 {
         if !is_12h {
@@ -2221,7 +2405,10 @@ fn resolve_composed(
     }
 
     // Extract base date from a possibly nested Composed form
-    fn extract_date(td: &TimeData, ref_time: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    fn extract_date(
+        td: &TimeData,
+        ref_time: DateTime<FixedOffset>,
+    ) -> Option<DateTime<FixedOffset>> {
         match &td.form {
             TimeForm::Composed(a, b) => {
                 // Try to get the date part (non-PartOfDay component)
@@ -2251,8 +2438,10 @@ fn resolve_composed(
             let mut dt = date_dt
                 .date_naive()
                 .and_hms_opt(hour, 0, 0)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             // Future-first: if result is past and date is today, advance to tomorrow
             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                 dt = Duration::try_days(1)
@@ -2268,8 +2457,10 @@ fn resolve_composed(
             let mut dt = date_dt
                 .date_naive()
                 .and_hms_opt(hour, *m, 0)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                 dt = Duration::try_days(1)
                     .and_then(|d| dt.checked_add_signed(d))
@@ -2282,8 +2473,10 @@ fn resolve_composed(
             let dt = date_dt
                 .date_naive()
                 .and_hms_opt(*h, *m, *s)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             return Some((dt, "second"));
         }
         TimeForm::Now => {
@@ -2325,8 +2518,10 @@ fn resolve_composed(
             let mut dt = date_dt
                 .date_naive()
                 .and_hms_opt(hour, 0, 0)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             // Future-first: if result is past and date is today, advance to tomorrow
             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                 dt = Duration::try_days(1)
@@ -2342,8 +2537,10 @@ fn resolve_composed(
             let mut dt = date_dt
                 .date_naive()
                 .and_hms_opt(hour, *m, 0)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             if dt <= ref_time && date_dt.date_naive() == ref_time.date_naive() {
                 dt = Duration::try_days(1)
                     .and_then(|d| dt.checked_add_signed(d))
@@ -2356,8 +2553,10 @@ fn resolve_composed(
             let dt = date_dt
                 .date_naive()
                 .and_hms_opt(*h, *m, *s)
-                .unwrap_or(date_dt.naive_utc())
-                .and_utc();
+                .unwrap_or(date_dt.naive_local())
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             return Some((dt, "second"));
         }
         _ => {}
@@ -2377,7 +2576,7 @@ fn resolve_composed(
                         let (future_base, _) = resolve_holiday_with_direction(name, ref_time, None);
                         let (past_base, _) =
                             resolve_holiday_with_direction(name, ref_time, Some(Direction::Past));
-                        let add_dur = |base: DateTime<Utc>| -> DateTime<Utc> {
+                        let add_dur = |base: DateTime<FixedOffset>| -> DateTime<FixedOffset> {
                             match grain {
                                 Grain::Week => Duration::try_weeks(*n)
                                     .and_then(|d| base.checked_add_signed(d))
@@ -2409,7 +2608,14 @@ fn resolve_composed(
                     };
                     let target_year = target_time.year();
                     if let Some(date) = resolve_holiday(name, target_year) {
-                        return Some((date.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day"));
+                        return Some((
+                            date.and_hms_opt(0, 0, 0)
+                                .unwrap()
+                                .and_local_timezone(*ref_time.offset())
+                                .single()
+                                .unwrap(),
+                            "day",
+                        ));
                     }
                 }
             }
@@ -2429,7 +2635,11 @@ fn resolve_composed(
                     | TimeForm::Today
             );
 
-            fn apply_duration(base: DateTime<Utc>, n: i64, grain: &Grain) -> Option<DateTime<Utc>> {
+            fn apply_duration(
+                base: DateTime<FixedOffset>,
+                n: i64,
+                grain: &Grain,
+            ) -> Option<DateTime<FixedOffset>> {
                 match grain {
                     Grain::Year => add_years(base, n),
                     Grain::Month => add_months(base, n),
@@ -2527,7 +2737,9 @@ fn resolve_composed(
                         .unwrap_or(offset_base.date_naive())
                         .and_hms_opt(0, 0, 0)
                         .unwrap()
-                        .and_utc();
+                        .and_local_timezone(*ref_time.offset())
+                        .single()
+                        .unwrap();
                     return Some((dt, "day"));
                 }
             }
@@ -2546,13 +2758,15 @@ fn resolve_composed(
         month: u32,
         day: u32,
         direction: Option<Direction>,
-        ref_time: DateTime<Utc>,
-    ) -> Option<(DateTime<Utc>, &'static str)> {
-        let build = |y: i32| -> Option<DateTime<Utc>> {
+        ref_time: DateTime<FixedOffset>,
+    ) -> Option<(DateTime<FixedOffset>, &'static str)> {
+        let build = |y: i32| -> Option<DateTime<FixedOffset>> {
             Some(
                 NaiveDate::from_ymd_opt(y, month, day)?
                     .and_hms_opt(0, 0, 0)?
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
             )
         };
         let ref_year = ref_time.year();
@@ -2604,7 +2818,16 @@ fn resolve_composed(
         // Holiday + Year: re-resolve the holiday for the target year
         if let TimeForm::Holiday(name, _) = &primary.form {
             match resolve_holiday(name, *y) {
-                Some(date) => return Some((date.and_hms_opt(0, 0, 0).unwrap().and_utc(), "day")),
+                Some(date) => {
+                    return Some((
+                        date.and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_local_timezone(*ref_time.offset())
+                            .single()
+                            .unwrap(),
+                        "day",
+                    ))
+                }
                 None => return Some((midnight(ref_time), "day")),
             }
         }
@@ -2616,7 +2839,9 @@ fn resolve_composed(
                     .unwrap_or(ref_time.date_naive())
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc();
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 return Some((dt, "day"));
             }
             TimeForm::Month(m) => {
@@ -2624,7 +2849,9 @@ fn resolve_composed(
                     .unwrap_or(ref_time.date_naive())
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc();
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 return Some((dt, "month"));
             }
             _ => {
@@ -2633,7 +2860,9 @@ fn resolve_composed(
                     .unwrap_or(ref_time.date_naive())
                     .and_hms_opt(base.hour(), base.minute(), base.second())
                     .unwrap()
-                    .and_utc();
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap();
                 return Some((dt, base_grain));
             }
         }
@@ -2645,7 +2874,9 @@ fn resolve_composed(
                 .unwrap_or(ref_time.date_naive())
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             return Some((dt, "month"));
         }
     }
@@ -2765,7 +2996,12 @@ fn resolve_composed(
             let target_date = chrono::Duration::try_days(days_to_target)
                 .and_then(|d| period_date.checked_add_signed(d))
                 .unwrap_or(period_date);
-            let dt = target_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let dt = target_date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             return Some((dt, "day"));
         }
     }
@@ -2788,7 +3024,12 @@ fn resolve_composed(
             let target_date = chrono::Duration::try_days(days_to_target)
                 .and_then(|d| period_date.checked_add_signed(d))
                 .unwrap_or(period_date);
-            let dt = target_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let dt = target_date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             return Some((dt, "day"));
         }
     }
@@ -2826,8 +3067,8 @@ fn resolve_nth_grain_interval(
     n: i64,
     grain: Grain,
     past: bool,
-    ref_time: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    ref_time: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let base = grain_start(ref_time, grain);
 
     if past {
@@ -2846,9 +3087,9 @@ fn resolve_nth_grain_interval(
 // ============================================================
 
 pub(super) fn resolve_weekend_interval(
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let dow = ref_time.weekday().num_days_from_monday(); // Mon=0..Sun=6
     let hour = ref_time.hour();
 
@@ -2926,8 +3167,8 @@ pub(super) fn resolve_weekend_interval(
 
 fn resolve_all_grain(
     grain: Grain,
-    ref_time: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    ref_time: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let from = grain_start(ref_time, grain);
     // "all week" end = start of next period minus 1 day for week
     // Actually: all week = [Mon, Sun) = 6 days
@@ -2954,9 +3195,9 @@ fn grain_for_all_rest(grain: Grain) -> &'static str {
 fn resolve_begin_end(
     begin: bool,
     target: &TimeForm,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     // Resolve the target period start
     let (period_start, grain) = match target {
         TimeForm::GrainOffset { grain, offset } => {
@@ -2970,7 +3211,9 @@ fn resolve_begin_end(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_local_timezone(*ref_time.offset())
+                    .single()
+                    .unwrap(),
                 Grain::Month,
             )
         }
@@ -2979,7 +3222,9 @@ fn resolve_begin_end(
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc();
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             (dt, Grain::Year)
         }
         _ => {
@@ -3017,11 +3262,11 @@ fn resolve_begin_end(
             let m = period_start.month();
             if begin {
                 // Beginning of month: day 1 to day 11 (exclusive)
-                let end = make_date(y, m, 11);
+                let end = make_date(y, m, 11, *ref_time.offset());
                 (period_start, end)
             } else {
                 // End of month: day 21 to end of month
-                let start = make_date(y, m, 21);
+                let start = make_date(y, m, 21, *ref_time.offset());
                 let end = add_grain(period_start, Grain::Month, 1)?;
                 (start, end)
             }
@@ -3030,12 +3275,12 @@ fn resolve_begin_end(
             let y = period_start.year();
             if begin {
                 // Beginning of year: month 1 to month 4 (Jan-Mar)
-                let end = make_date(y, 4, 1);
+                let end = make_date(y, 4, 1, *ref_time.offset());
                 (period_start, end)
             } else {
                 // End of year: month 9 to end of year (Sep-Dec)
-                let start = make_date(y, 9, 1);
-                let end = make_date(y.saturating_add(1), 1, 1);
+                let start = make_date(y, 9, 1, *ref_time.offset());
+                let end = make_date(y.saturating_add(1), 1, 1, *ref_time.offset());
                 (start, end)
             }
         }
@@ -3121,33 +3366,43 @@ fn target_grain(form: &TimeForm) -> Grain {
 
 pub(super) fn resolve_season_interval(
     season: u32,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> (DateTime<Utc>, DateTime<Utc>) {
+) -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
     let year = ref_time.year();
+    let offset = *ref_time.offset();
 
     // Season dates (Northern Hemisphere meteorological approximation)
     let (from, to) = match season {
         0 => {
             // Spring: ~Mar 20 to ~Jun 21
-            (make_date(year, 3, 20), make_date(year, 6, 21))
+            (
+                make_date(year, 3, 20, offset),
+                make_date(year, 6, 21, offset),
+            )
         }
         1 => {
             // Summer: ~Jun 21 to ~Sep 24
-            (make_date(year, 6, 21), make_date(year, 9, 24))
+            (
+                make_date(year, 6, 21, offset),
+                make_date(year, 9, 24, offset),
+            )
         }
         2 => {
             // Fall: ~Sep 23 to ~Dec 21
-            (make_date(year, 9, 23), make_date(year, 12, 21))
+            (
+                make_date(year, 9, 23, offset),
+                make_date(year, 12, 21, offset),
+            )
         }
         3 => {
             // Winter: ~Dec 21 prev to ~Mar 21
             (
-                make_date(year.saturating_sub(1), 12, 21),
-                make_date(year, 3, 21),
+                make_date(year.saturating_sub(1), 12, 21, offset),
+                make_date(year, 3, 21, offset),
             )
         }
-        _ => (make_date(year, 1, 1), make_date(year, 4, 1)),
+        _ => (make_date(year, 1, 1, offset), make_date(year, 4, 1, offset)),
     };
 
     match direction {
@@ -3155,20 +3410,20 @@ pub(super) fn resolve_season_interval(
             // Previous season
             let (_from, _to) = match season {
                 0 => (
-                    make_date(year.saturating_sub(1), 3, 20),
-                    make_date(year.saturating_sub(1), 6, 21),
+                    make_date(year.saturating_sub(1), 3, 20, offset),
+                    make_date(year.saturating_sub(1), 6, 21, offset),
                 ),
                 1 => (
-                    make_date(year.saturating_sub(1), 6, 21),
-                    make_date(year.saturating_sub(1), 9, 24),
+                    make_date(year.saturating_sub(1), 6, 21, offset),
+                    make_date(year.saturating_sub(1), 9, 24, offset),
                 ),
                 2 => (
-                    make_date(year.saturating_sub(1), 9, 23),
-                    make_date(year.saturating_sub(1), 12, 21),
+                    make_date(year.saturating_sub(1), 9, 23, offset),
+                    make_date(year.saturating_sub(1), 12, 21, offset),
                 ),
                 3 => (
-                    make_date(year.saturating_sub(2), 12, 21),
-                    make_date(year.saturating_sub(1), 3, 21),
+                    make_date(year.saturating_sub(2), 12, 21, offset),
+                    make_date(year.saturating_sub(1), 3, 21, offset),
                 ),
                 _ => (from, to),
             };
@@ -3180,29 +3435,29 @@ pub(super) fn resolve_season_interval(
             } else {
                 current_season.saturating_sub(1)
             };
-            season_dates(prev_season, year, direction)
+            season_dates(prev_season, year, direction, offset)
         }
         Some(Direction::Future) | Some(Direction::FarFuture) => {
             let current_season = current_season_number(ref_time);
             let next_season = current_season.saturating_add(1) % 4;
-            season_dates(next_season, year, direction)
+            season_dates(next_season, year, direction, offset)
         }
         None => {
             if season == 99 {
                 // Generic "season" → use current season with slightly different dates
                 let current = current_season_number(ref_time);
-                generic_season_dates(current, year)
+                generic_season_dates(current, year, offset)
             } else {
                 // Specific season like "this Summer" → use that season
                 // If the season hasn't started yet this year, show this year's
                 // If it's already past, show this year's (it's "this" not "next")
-                season_dates(season, year, None)
+                season_dates(season, year, None, offset)
             }
         }
     }
 }
 
-fn current_season_number(ref_time: DateTime<Utc>) -> u32 {
+fn current_season_number(ref_time: DateTime<FixedOffset>) -> u32 {
     let month = ref_time.month();
     let day = ref_time.day();
     match month {
@@ -3223,36 +3478,59 @@ fn season_dates(
     season: u32,
     year: i32,
     direction: Option<Direction>,
-) -> (DateTime<Utc>, DateTime<Utc>) {
+    offset: FixedOffset,
+) -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
     match season {
-        0 => (make_date(year, 3, 20), make_date(year, 6, 20)),
-        1 => (make_date(year, 6, 21), make_date(year, 9, 24)),
+        0 => (
+            make_date(year, 3, 20, offset),
+            make_date(year, 6, 20, offset),
+        ),
+        1 => (
+            make_date(year, 6, 21, offset),
+            make_date(year, 9, 24, offset),
+        ),
         2 => match direction {
             Some(Direction::Past) => (
-                make_date(year.saturating_sub(1), 9, 23),
-                make_date(year.saturating_sub(1), 12, 20),
+                make_date(year.saturating_sub(1), 9, 23, offset),
+                make_date(year.saturating_sub(1), 12, 20, offset),
             ),
-            _ => (make_date(year, 9, 23), make_date(year, 12, 20)),
+            _ => (
+                make_date(year, 9, 23, offset),
+                make_date(year, 12, 20, offset),
+            ),
         },
         3 => (
-            make_date(year.saturating_sub(1), 12, 21),
-            make_date(year, 3, 21),
+            make_date(year.saturating_sub(1), 12, 21, offset),
+            make_date(year, 3, 21, offset),
         ),
-        _ => (make_date(year, 1, 1), make_date(year, 4, 1)),
+        _ => (make_date(year, 1, 1, offset), make_date(year, 4, 1, offset)),
     }
 }
 
 /// Generic "this season" / "current season" uses slightly different boundary dates
-fn generic_season_dates(season: u32, year: i32) -> (DateTime<Utc>, DateTime<Utc>) {
+fn generic_season_dates(
+    season: u32,
+    year: i32,
+    offset: FixedOffset,
+) -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
     match season {
-        0 => (make_date(year, 3, 20), make_date(year, 6, 20)),
-        1 => (make_date(year, 6, 21), make_date(year, 9, 24)),
-        2 => (make_date(year, 9, 23), make_date(year, 12, 20)),
-        3 => (
-            make_date(year.saturating_sub(1), 12, 21),
-            make_date(year, 3, 19),
+        0 => (
+            make_date(year, 3, 20, offset),
+            make_date(year, 6, 20, offset),
         ),
-        _ => (make_date(year, 1, 1), make_date(year, 4, 1)),
+        1 => (
+            make_date(year, 6, 21, offset),
+            make_date(year, 9, 24, offset),
+        ),
+        2 => (
+            make_date(year, 9, 23, offset),
+            make_date(year, 12, 20, offset),
+        ),
+        3 => (
+            make_date(year.saturating_sub(1), 12, 21, offset),
+            make_date(year, 3, 19, offset),
+        ),
+        _ => (make_date(year, 1, 1, offset), make_date(year, 4, 1, offset)),
     }
 }
 
@@ -3264,7 +3542,8 @@ pub(super) fn pod_interval(
     pod: PartOfDay,
     date: NaiveDate,
     early_late: Option<EarlyLate>,
-) -> (DateTime<Utc>, DateTime<Utc>) {
+    offset: FixedOffset,
+) -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
     let (start_h, end_h) = match (pod, early_late) {
         (PartOfDay::Morning, Some(EarlyLate::Early)) => (0, 9),
         (PartOfDay::Morning, _) => (0, 12),
@@ -3276,16 +3555,14 @@ pub(super) fn pod_interval(
         (PartOfDay::Lunch, _) => (12, 14),
     };
 
-    let from = date.and_hms_opt(start_h, 0, 0).unwrap().and_utc();
+    let from = fixed_at(offset, date, start_h, 0, 0);
     let to = if end_h >= 24 {
-        (date
+        let next_day = date
             .checked_add_signed(Duration::try_days(1).unwrap_or_default())
-            .unwrap_or(date))
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+            .unwrap_or(date);
+        fixed_at(offset, next_day, 0, 0, 0)
     } else {
-        date.and_hms_opt(end_h, 0, 0).unwrap().and_utc()
+        fixed_at(offset, date, end_h, 0, 0)
     };
     (from, to)
 }
@@ -3294,19 +3571,31 @@ pub(super) fn pod_interval(
 // Helper functions
 // ============================================================
 
-pub(super) fn midnight(dt: DateTime<Utc>) -> DateTime<Utc> {
-    dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
+fn fixed(naive: NaiveDateTime, offset: FixedOffset) -> DateTime<FixedOffset> {
+    offset.from_local_datetime(&naive).single().unwrap()
 }
 
-fn make_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    NaiveDate::from_ymd_opt(y, m, d)
-        .unwrap_or(NaiveDate::from_ymd_opt(y, 1, 1).unwrap())
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+fn fixed_at(
+    offset: FixedOffset,
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> DateTime<FixedOffset> {
+    fixed(date.and_hms_opt(hour, minute, second).unwrap(), offset)
 }
 
-fn start_of_week(dt: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn midnight(dt: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    fixed_at(*dt.offset(), dt.date_naive(), 0, 0, 0)
+}
+
+fn make_date(y: i32, m: u32, d: u32, offset: FixedOffset) -> DateTime<FixedOffset> {
+    let date =
+        NaiveDate::from_ymd_opt(y, m, d).unwrap_or(NaiveDate::from_ymd_opt(y, 1, 1).unwrap());
+    fixed_at(offset, date, 0, 0, 0)
+}
+
+fn start_of_week(dt: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
     let dow = dt.weekday().num_days_from_monday();
     midnight(
         Duration::try_days(dow as i64)
@@ -3315,45 +3604,51 @@ fn start_of_week(dt: DateTime<Utc>) -> DateTime<Utc> {
     )
 }
 
-fn start_of_month(dt: DateTime<Utc>) -> DateTime<Utc> {
-    NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+fn start_of_month(dt: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    fixed_at(
+        *dt.offset(),
+        NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap(),
+        0,
+        0,
+        0,
+    )
 }
 
-fn start_of_year(dt: DateTime<Utc>) -> DateTime<Utc> {
-    NaiveDate::from_ymd_opt(dt.year(), 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+fn start_of_year(dt: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    fixed_at(
+        *dt.offset(),
+        NaiveDate::from_ymd_opt(dt.year(), 1, 1).unwrap(),
+        0,
+        0,
+        0,
+    )
 }
 
-fn start_of_quarter(dt: DateTime<Utc>) -> DateTime<Utc> {
+fn start_of_quarter(dt: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
     let q = dt.month().saturating_sub(1) / 3;
     let month = q.saturating_mul(3).saturating_add(1);
-    NaiveDate::from_ymd_opt(dt.year(), month, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+    fixed_at(
+        *dt.offset(),
+        NaiveDate::from_ymd_opt(dt.year(), month, 1).unwrap(),
+        0,
+        0,
+        0,
+    )
 }
 
-pub(super) fn grain_start(dt: DateTime<Utc>, grain: Grain) -> DateTime<Utc> {
+pub(super) fn grain_start(dt: DateTime<FixedOffset>, grain: Grain) -> DateTime<FixedOffset> {
     match grain {
         Grain::NoGrain | Grain::Second => dt,
         Grain::Minute => dt
             .date_naive()
             .and_hms_opt(dt.hour(), dt.minute(), 0)
-            .unwrap()
-            .and_utc(),
+            .map(|naive| fixed(naive, *dt.offset()))
+            .unwrap(),
         Grain::Hour => dt
             .date_naive()
             .and_hms_opt(dt.hour(), 0, 0)
-            .unwrap()
-            .and_utc(),
+            .map(|naive| fixed(naive, *dt.offset()))
+            .unwrap(),
         Grain::Day => midnight(dt),
         Grain::Week => start_of_week(dt),
         Grain::Month => start_of_month(dt),
@@ -3362,7 +3657,11 @@ pub(super) fn grain_start(dt: DateTime<Utc>, grain: Grain) -> DateTime<Utc> {
     }
 }
 
-pub(super) fn add_grain(dt: DateTime<Utc>, grain: Grain, n: i64) -> Option<DateTime<Utc>> {
+pub(super) fn add_grain(
+    dt: DateTime<FixedOffset>,
+    grain: Grain,
+    n: i64,
+) -> Option<DateTime<FixedOffset>> {
     match grain {
         Grain::NoGrain | Grain::Second => {
             Duration::try_seconds(n).and_then(|d| dt.checked_add_signed(d))
@@ -3377,7 +3676,7 @@ pub(super) fn add_grain(dt: DateTime<Utc>, grain: Grain, n: i64) -> Option<DateT
     }
 }
 
-pub(super) fn add_months(dt: DateTime<Utc>, months: i64) -> Option<DateTime<Utc>> {
+pub(super) fn add_months(dt: DateTime<FixedOffset>, months: i64) -> Option<DateTime<FixedOffset>> {
     let total = i64::from(dt.year())
         .checked_mul(12)?
         .checked_add(i64::from(dt.month()).checked_sub(1)?)?
@@ -3387,16 +3686,16 @@ pub(super) fn add_months(dt: DateTime<Utc>, months: i64) -> Option<DateTime<Utc>
     let day = dt.day().min(days_in_month(year, month));
     let date = NaiveDate::from_ymd_opt(year, month, day)?;
     let naive = date.and_hms_opt(dt.hour(), dt.minute(), dt.second())?;
-    Some(naive.and_utc())
+    Some(fixed(naive, *dt.offset()))
 }
 
-pub(super) fn add_years(dt: DateTime<Utc>, years: i64) -> Option<DateTime<Utc>> {
+pub(super) fn add_years(dt: DateTime<FixedOffset>, years: i64) -> Option<DateTime<FixedOffset>> {
     let year_i64 = i64::from(dt.year()).checked_add(years)?;
     let year = i32::try_from(year_i64).ok()?;
     let day = dt.day().min(days_in_month(year, dt.month()));
     let date = NaiveDate::from_ymd_opt(year, dt.month(), day)?;
     let naive = date.and_hms_opt(dt.hour(), dt.minute(), dt.second())?;
-    Some(naive.and_utc())
+    Some(fixed(naive, *dt.offset()))
 }
 
 #[allow(clippy::arithmetic_side_effects)]
@@ -3426,19 +3725,34 @@ fn is_leap_year(year: i32) -> bool {
 #[allow(clippy::arithmetic_side_effects)]
 fn resolve_holiday_with_direction(
     name: &str,
-    ref_time: DateTime<Utc>,
+    ref_time: DateTime<FixedOffset>,
     direction: Option<Direction>,
-) -> (DateTime<Utc>, &'static str) {
+) -> (DateTime<FixedOffset>, &'static str) {
     let ref_midnight = midnight(ref_time);
     let this_year = ref_time.year();
 
     // Resolve for this year
-    let this_year_date =
-        resolve_holiday(name, this_year).map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc());
-    let next_year_date =
-        resolve_holiday(name, this_year + 1).map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc());
-    let prev_year_date =
-        resolve_holiday(name, this_year - 1).map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc());
+    let this_year_date = resolve_holiday(name, this_year).map(|d| {
+        d.and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(*ref_time.offset())
+            .single()
+            .unwrap()
+    });
+    let next_year_date = resolve_holiday(name, this_year + 1).map(|d| {
+        d.and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(*ref_time.offset())
+            .single()
+            .unwrap()
+    });
+    let prev_year_date = resolve_holiday(name, this_year - 1).map(|d| {
+        d.and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(*ref_time.offset())
+            .single()
+            .unwrap()
+    });
 
     let result = match direction {
         Some(Direction::Past) => {
@@ -3642,7 +3956,8 @@ pub(super) fn resolve_holiday_interval(name: &str, year: i32) -> Option<(NaiveDa
 pub(super) fn resolve_holiday_minute_interval(
     name: &str,
     year: i32,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    offset: FixedOffset,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let name_lower = name.to_lowercase();
     let name = name_lower.as_str();
 
@@ -3656,8 +3971,8 @@ pub(super) fn resolve_holiday_minute_interval(
         } else {
             last_sat
         };
-        let from = date.and_hms_opt(20, 30, 0).unwrap().and_utc();
-        let to = date.and_hms_opt(21, 31, 0).unwrap().and_utc(); // 60 minutes later, closed interval
+        let from = fixed_at(offset, date, 20, 30, 0);
+        let to = fixed_at(offset, date, 21, 31, 0); // 60 minutes later, closed interval
         return Some((from, to));
     }
 
@@ -4282,18 +4597,16 @@ fn mini_tuesday_date(year: i32) -> Option<NaiveDate> {
 #[allow(clippy::arithmetic_side_effects)]
 fn find_dow_date_intersection(
     dow: u32,
-    base_dt: DateTime<Utc>,
+    base_dt: DateTime<FixedOffset>,
     month: u32,
     day: u32,
     year: Option<i32>,
-) -> DateTime<Utc> {
+) -> DateTime<FixedOffset> {
+    let offset = *base_dt.offset();
     if let Some(y) = year {
         // Year is fixed — just return the date regardless of DOW
-        return NaiveDate::from_ymd_opt(y, month, day)
-            .unwrap_or(base_dt.date_naive())
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
+        let date = NaiveDate::from_ymd_opt(y, month, day).unwrap_or(base_dt.date_naive());
+        return fixed_at(offset, date, 0, 0, 0);
     }
     // Search both forward and backward to find the nearest year where DOW matches
     let ref_date = base_dt.date_naive();
@@ -4316,22 +4629,28 @@ fn find_dow_date_intersection(
             }
         }
     }
-    best.unwrap_or(base_dt.date_naive())
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+    fixed_at(offset, best.unwrap_or(base_dt.date_naive()), 0, 0, 0)
 }
 
 /// Find next date where both DOW and day-of-month match.
 /// E.g., "Thu 15th" — find next 15th that falls on a Thursday.
-fn find_dow_dom_intersection(dow: u32, day: u32, ref_time: DateTime<Utc>) -> DateTime<Utc> {
+fn find_dow_dom_intersection(
+    dow: u32,
+    day: u32,
+    ref_time: DateTime<FixedOffset>,
+) -> DateTime<FixedOffset> {
     // Search forward from ref_time up to 12 months
     let mut dt = ref_time;
     for _ in 0..12 {
         let y = dt.year();
         let m = dt.month();
         if let Some(date) = NaiveDate::from_ymd_opt(y, m, day) {
-            let candidate = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let candidate = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap();
             if candidate > ref_time && date.weekday().num_days_from_monday() == dow {
                 return candidate;
             }
@@ -4342,7 +4661,9 @@ fn find_dow_dom_intersection(dow: u32, day: u32, ref_time: DateTime<Utc>) -> Dat
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-                .and_utc(),
+                .and_local_timezone(*ref_time.offset())
+                .single()
+                .unwrap(),
             1,
         )
         .unwrap_or(dt);

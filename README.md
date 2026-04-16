@@ -13,13 +13,14 @@ Time, Numeral, Ordinal, Temperature, Distance, Volume, Quantity, AmountOfMoney, 
 ```rust
 use duckling::{parse, Entity, Locale, Lang, Context, Options, DimensionKind, DimensionValue,
                MeasurementValue, TimeValue, TimePoint, Grain};
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{FixedOffset, NaiveDate, TimeZone};
 
 let locale = Locale::new(Lang::EN, None);
-let context = Context {
-    reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-    ..Context::default()
-};
+let context = Context::new(
+    FixedOffset::east_opt(0).unwrap()
+        .with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+    locale,
+);
 let options = Options::default();
 
 // Time — "tomorrow at 3pm" parses as a naive (wall-clock) time
@@ -53,14 +54,14 @@ assert_eq!(results, vec![Entity {
 Time values distinguish between absolute instants and wall-clock/calendar times:
 
 - **Naive** — `"5 pm"`, `"tomorrow"`, `"March 15th"` — wall-clock times with no timezone assumption
-- **Instant** — `"now"`, `"in 2 hours"`, `"5 pm EST"` — pinned to a specific UTC moment
+- **Instant** — `"now"`, `"in 2 hours"`, `"5 pm EST"` — pinned to a specific offset-aware moment
 
 ```text
 // Naive: no timezone baked in
 TimeValue::Single { value: TimePoint::Naive { value: NaiveDateTime, grain }, values: Vec<TimePoint> }
 
-// Instant: absolute UTC moment
-TimeValue::Single { value: TimePoint::Instant { value: DateTime<Utc>, grain }, values: Vec<TimePoint> }
+// Instant: absolute fixed-offset moment
+TimeValue::Single { value: TimePoint::Instant { value: DateTime<FixedOffset>, grain }, values: Vec<TimePoint> }
 ```
 
 An explicit timezone (e.g. `"3pm CET"`) promotes any naive time to an instant.

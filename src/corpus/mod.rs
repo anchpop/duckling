@@ -59,7 +59,7 @@ pub fn datetime(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32, grain: Grain) -
                 .unwrap()
                 .and_hms_opt(h, mi, s)
                 .unwrap();
-            value.naive_utc() == expected && *g == grain
+            value.naive_local() == expected && *g == grain
         }
         _ => false,
     })
@@ -117,12 +117,12 @@ pub fn datetime_interval(
             let from_matches = match from {
                 TimePoint::Naive { value, grain: g } => *value == expected_from && *g == grain,
                 TimePoint::Instant { value, grain: g } => {
-                    value.naive_utc() == expected_from && *g == grain
+                    value.naive_local() == expected_from && *g == grain
                 }
             };
             let to_matches = match to {
                 TimePoint::Naive { value, .. } => *value == expected_to,
-                TimePoint::Instant { value, .. } => value.naive_utc() == expected_to,
+                TimePoint::Instant { value, .. } => value.naive_local() == expected_to,
             };
             from_matches && to_matches
         }
@@ -174,7 +174,7 @@ pub fn datetime_open_interval_after(
             match from {
                 TimePoint::Naive { value, grain: g } => *value == expected && *g == grain,
                 TimePoint::Instant { value, grain: g } => {
-                    value.naive_utc() == expected && *g == grain
+                    value.naive_local() == expected && *g == grain
                 }
             }
         }
@@ -204,7 +204,7 @@ pub fn datetime_open_interval_before(
                 .unwrap();
             match to {
                 TimePoint::Naive { value, .. } => *value == expected,
-                TimePoint::Instant { value, .. } => value.naive_utc() == expected,
+                TimePoint::Instant { value, .. } => value.naive_local() == expected,
             }
         }
         _ => false,

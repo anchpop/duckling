@@ -1,15 +1,17 @@
-use chrono::{TimeZone, Utc};
+use chrono::{FixedOffset, TimeZone};
 use duckling::{
     parse, Context, DimensionKind, DimensionValue, IntervalEndpoints, Lang, Locale, Options,
     TimePoint, TimeValue,
 };
 
 fn context(locale: Locale) -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
+    Context::new(
+        FixedOffset::west_opt(5 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2013, 2, 12, 4, 30, 0)
+            .unwrap(),
         locale,
-        timezone_offset_minutes: -300,
-    }
+    )
 }
 
 fn parse_time_no_panic(text: &str, locale: Locale) -> Vec<duckling::Entity> {

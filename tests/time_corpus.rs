@@ -1,19 +1,40 @@
 // Ported from Duckling/Time/EN/Corpus.hs
-// Reference time for tests: 2013-02-12 04:30:00 UTC
+// Reference time for tests: 2013-02-12 04:30:00 UTC-02:00
 // All expected values from Haskell corpus at /tmp/duckling-haskell/Duckling/Time/EN/Corpus.hs
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use duckling::{
     parse, Context, DimensionKind, DimensionValue, Entity, Grain, Lang, Locale, Options, TimePoint,
     TimeValue,
 };
 
+fn fixed_offset(offset_minutes: i32) -> FixedOffset {
+    FixedOffset::east_opt(offset_minutes.checked_mul(60).unwrap()).unwrap()
+}
+
+fn local_datetime(
+    offset_minutes: i32,
+    y: i32,
+    m: u32,
+    d: u32,
+    h: u32,
+    mi: u32,
+    s: u32,
+) -> DateTime<FixedOffset> {
+    fixed_offset(offset_minutes)
+        .with_ymd_and_hms(y, m, d, h, mi, s)
+        .unwrap()
+}
+
+fn context_at(reference_time: DateTime<FixedOffset>, locale: Locale) -> Context {
+    Context::new(reference_time, locale)
+}
+
 fn make_context() -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -120, // UTC-2, matching Haskell test context
-    }
+    context_at(
+        local_datetime(-120, 2013, 2, 12, 4, 30, 0),
+        Locale::new(Lang::EN, None),
+    )
 }
 
 fn parse_time(text: &str) -> Vec<Entity> {
@@ -29,12 +50,6 @@ fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> NaiveDateTime {
         .unwrap()
         .and_hms_opt(h, mi, s)
         .unwrap()
-}
-
-/// Build a DateTime<Utc> from components (for instant/absolute time tests)
-#[allow(dead_code)]
-fn dt_utc(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-    dt(y, m, d, h, mi, s).and_utc()
 }
 
 fn grain(s: &str) -> Grain {
@@ -64,7 +79,7 @@ fn check_time_instant(text: &str, expected_value: NaiveDateTime, expected_grain:
     let entities = parse_time(text);
     let eg = grain(expected_grain);
     let found = entities.iter().any(|e| {
-        matches!(&e.value, DimensionValue::Time(TimeValue::Single { value: TimePoint::Instant { value, grain }, .. }) if value.naive_utc() == expected_value && *grain == eg)
+        matches!(&e.value, DimensionValue::Time(TimeValue::Single { value: TimePoint::Instant { value, grain }, .. }) if value.naive_local() == expected_value && *grain == eg)
     });
     assert!(
         found,
@@ -82,7 +97,7 @@ fn check_time_instant(text: &str, expected_value: NaiveDateTime, expected_grain:
 /// Extract NaiveDateTime and Grain from a TimePoint (works for both Instant and Naive)
 fn tp_value_grain(tp: &TimePoint) -> (NaiveDateTime, Grain) {
     match tp {
-        TimePoint::Instant { value, grain } => (value.naive_utc(), *grain),
+        TimePoint::Instant { value, grain } => (value.naive_local(), *grain),
         TimePoint::Naive { value, grain } => (*value, *grain),
     }
 }
@@ -3170,18 +3185,14 @@ fn test_iso_date_no_spurious_interval() {
 fn test_iso8601_t_separator_z_parses_as_single_datetime() {
     let text = "2018-04-01T18:03:40Z";
     let locale = Locale::new(Lang::EN, None);
-    let context = Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-        locale,
-        timezone_offset_minutes: 0,
-    };
+    let context = context_at(local_datetime(0, 2013, 2, 12, 4, 30, 0), locale);
     let options = Options::default();
     let entities = parse(text, &locale, &[DimensionKind::Time], &context, &options);
     let found = entities.iter().any(|e| {
         matches!(
             &e.value,
             DimensionValue::Time(TimeValue::Single { value: TimePoint::Instant { value, grain: Grain::Minute }, .. })
-                if value.naive_utc() == dt(2018, 4, 1, 18, 3, 40)
+                if value.naive_local() == dt(2018, 4, 1, 18, 3, 40)
         )
     });
     assert!(
@@ -3239,11 +3250,7 @@ fn test_last_april_first_march_2018_ref() {
     // Regression: with ref time in March 2018, "last April 1" should resolve
     // to 2017-04-01 (the most recent past April 1), not 2018-04-01.
     let locale = Locale::new(Lang::EN, None);
-    let context = Context {
-        reference_time: Utc.with_ymd_and_hms(2018, 3, 15, 12, 0, 0).unwrap(),
-        locale,
-        timezone_offset_minutes: 0,
-    };
+    let context = context_at(local_datetime(0, 2018, 3, 15, 12, 0, 0), locale);
     let options = Options::default();
     let entities = parse(
         "last April 1",
@@ -5074,20 +5081,18 @@ fn check_time_interval_with_context(
 
 /// Saturday Feb 9, 2013 10:00 — inside a weekend
 fn make_saturday_context() -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 9, 10, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -120,
-    }
+    context_at(
+        local_datetime(-120, 2013, 2, 9, 10, 0, 0),
+        Locale::new(Lang::EN, None),
+    )
 }
 
 /// Friday Feb 8, 2013 20:00 — inside a weekend (Friday evening)
 fn make_friday_evening_context() -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 8, 20, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -120,
-    }
+    context_at(
+        local_datetime(-120, 2013, 2, 8, 20, 0, 0),
+        Locale::new(Lang::EN, None),
+    )
 }
 
 #[test]

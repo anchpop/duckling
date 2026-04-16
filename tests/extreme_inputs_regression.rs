@@ -1,15 +1,36 @@
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 use duckling::{
     parse, Context, DimensionKind, DimensionValue, Entity, Grain, Lang, Locale, MeasurementValue,
     Options, TimePoint, TimeValue,
 };
 
+fn fixed_offset(offset_minutes: i32) -> FixedOffset {
+    FixedOffset::east_opt(offset_minutes.checked_mul(60).unwrap()).unwrap()
+}
+
+fn local_datetime(
+    offset_minutes: i32,
+    y: i32,
+    m: u32,
+    d: u32,
+    h: u32,
+    mi: u32,
+    s: u32,
+) -> DateTime<FixedOffset> {
+    fixed_offset(offset_minutes)
+        .with_ymd_and_hms(y, m, d, h, mi, s)
+        .unwrap()
+}
+
+fn context_at(reference_time: DateTime<FixedOffset>, locale: Locale) -> Context {
+    Context::new(reference_time, locale)
+}
+
 fn context_en() -> Context {
-    Context {
-        reference_time: Utc.with_ymd_and_hms(2013, 2, 12, 4, 30, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -120,
-    }
+    context_at(
+        local_datetime(-120, 2013, 2, 12, 4, 30, 0),
+        Locale::new(Lang::EN, None),
+    )
 }
 
 fn parse_no_panic(text: &str, dims: &[DimensionKind]) -> Vec<duckling::Entity> {
@@ -79,6 +100,63 @@ fn test_extreme_inputs_do_not_panic_all_dimensions() {
 }
 
 #[test]
+fn test_deeply_composable_time_input_does_not_hang() {
+    // Found by cargo-fuzz: month prefix ("Mar") plus numeric fragments build
+    // deeply nested `TimeForm::Composed` trees, which used to blow up
+    // exponentially inside `series::generate_series` (~49s on a 16-byte input).
+    // Should now resolve well under a second thanks to MAX_COMPOSE_DEPTH.
+    let input = "a Mar \n5 4\n4\n5 4";
+    let dims = [
+        DimensionKind::Numeral,
+        DimensionKind::Temperature,
+        DimensionKind::Time,
+    ];
+    let start = std::time::Instant::now();
+    let _ = parse_no_panic(input, &dims);
+    let elapsed = start.elapsed();
+    // Generous ceiling so this passes in debug mode too. Release is ~250ms;
+    // debug is a few seconds; a real regression (work budget removed) goes
+    // to tens of seconds.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "parse({input:?}) took {elapsed:?}, expected <10s"
+    );
+}
+
+#[test]
+fn test_weekday_number_grid_does_not_hang() {
+    // Reduced from an Outlook SpiceJet marketing email (~1.2KB, 57 date-ish
+    // tokens) that made parse() spin for ~19s before the per-parse work
+    // budget was added. Rows like "THU FRI SAT SUN 19 20 21 22" produce a
+    // combinatorial fanout of weekday/day-of-month compose candidates.
+    let input = "MARCH THU FRI SAT SUN 19 20 21 22 TAKE THE DAY OFF \
+                 APRIL FRI SAT SUN 3 4 5 \
+                 SAT SUN MON TUE 11 12 13 14 TAKE THE DAY OFF \
+                 MAY FRI SAT SUN 1 2 3 \
+                 AUGUST FRI SAT SUN 28 29 30 \
+                 SEPTEMBER FRI SAT SUN 4 5 6 \
+                 SAT SUN MON 12 13 14 \
+                 OCTOBER FRI SAT SUN 2 3 4 \
+                 SAT SUN MON TUE 17 18 19 20 \
+                 NOVEMBER SAT SUN MON 7 8 9 \
+                 SAT SUN MON TUE 21 22 23 24 TAKE THE DAY OFF \
+                 DECEMBER FRI SAT SUN 25 26 27";
+    let dims = [
+        DimensionKind::Numeral,
+        DimensionKind::Ordinal,
+        DimensionKind::Time,
+        DimensionKind::Duration,
+    ];
+    let start = std::time::Instant::now();
+    let _ = parse_no_panic(input, &dims);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "weekday-grid parse took {elapsed:?}, expected <15s"
+    );
+}
+
+#[test]
 fn test_overflowing_time_inputs_return_no_time_entities() {
     let cases = ["in 9999999999999999 days"];
     for text in cases {
@@ -116,11 +194,10 @@ fn test_real_world_event_listing_exact_entities() {
         name: Mon Ami Gabi";
 
     let locale = Locale::new(Lang::EN, None);
-    let ctx = Context {
-        reference_time: Utc.with_ymd_and_hms(2025, 3, 5, 12, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -360,
-    };
+    let ctx = context_at(
+        local_datetime(-360, 2025, 3, 5, 12, 0, 0),
+        Locale::new(Lang::EN, None),
+    );
     let options = Options::default();
     let dims = [
         DimensionKind::Time,
@@ -324,11 +401,10 @@ fn test_email_like_marketing_text_no_time_entities_1() {
     let text = "body: Dear Andre Popovitch, We'd love to learn more about why you chose AgelessRx as your partner in longevity. Your feedback may help inspire others to add healthy years to their life. How did we do? ○\nfrom: <noreply.invitations@trustpilotmail.com>\nsubject: Inspire others to add healthy years to their life ⭐⭐⭐⭐⭐";
 
     let locale = Locale::new(Lang::EN, None);
-    let ctx = Context {
-        reference_time: Utc.with_ymd_and_hms(2025, 3, 5, 12, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -360,
-    };
+    let ctx = context_at(
+        local_datetime(-360, 2025, 3, 5, 12, 0, 0),
+        Locale::new(Lang::EN, None),
+    );
     let options = Options::default();
     let dims = [
         DimensionKind::Time,
@@ -355,11 +431,10 @@ fn test_email_like_marketing_text_no_time_entities_2() {
     let text = "body: Flowers all season long, from $24.95\nfrom: Fast-Growing-Trees.com <plantexperts@fast-growing-trees.com>\nsubject: 💌 A gift for you";
 
     let locale = Locale::new(Lang::EN, None);
-    let ctx = Context {
-        reference_time: Utc.with_ymd_and_hms(2025, 3, 5, 12, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -360,
-    };
+    let ctx = context_at(
+        local_datetime(-360, 2025, 3, 5, 12, 0, 0),
+        Locale::new(Lang::EN, None),
+    );
     let options = Options::default();
     let dims = [
         DimensionKind::Time,
@@ -386,11 +461,10 @@ fn test_iso_date_in_sentence_() {
     let text = "On 2018-04-01 we met.";
 
     let locale = Locale::new(Lang::EN, None);
-    let ctx = Context {
-        reference_time: Utc.with_ymd_and_hms(2025, 3, 5, 12, 0, 0).unwrap(),
-        locale: Locale::new(Lang::EN, None),
-        timezone_offset_minutes: -360,
-    };
+    let ctx = context_at(
+        local_datetime(-360, 2025, 3, 5, 12, 0, 0),
+        Locale::new(Lang::EN, None),
+    );
     let options = Options::default();
     let dims = [
         DimensionKind::Time,

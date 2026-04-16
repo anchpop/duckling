@@ -190,7 +190,19 @@ pub struct Locale {
 }
 
 impl Locale {
-    /// Create a new locale.
+    /// Create a new locale. Unsupported language/region pairs are normalized to `region = None`.
+    ///
+    /// ```
+    /// use duckling::{Locale, Lang, Region};
+    ///
+    /// let en_gb = Locale::new(Lang::EN, Some(Region::GB));
+    /// assert_eq!(en_gb.lang, Lang::EN);
+    /// assert_eq!(en_gb.region, Some(Region::GB));
+    ///
+    /// // Region is dropped when the language has no region-specific rules for it.
+    /// let ar_us = Locale::new(Lang::AR, Some(Region::US));
+    /// assert_eq!(ar_us.region, None);
+    /// ```
     pub fn new(lang: Lang, region: Option<Region>) -> Self {
         Locale {
             lang,
